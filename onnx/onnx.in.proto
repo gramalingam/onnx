@@ -180,7 +180,6 @@ message AttributeProto {
 
     };
 
-
     // The shape of the tensor.
     repeated int64 dims = 1;
 
