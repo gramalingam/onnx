@@ -9008,10 +9008,11 @@ for test_name, shape in test_cases.items():
   The scan operation returns the final values of the state_variables as well as the
   scan_outputs.
   
-  The operation supports batching, and the batch-axis is required to be 0.
-  When multiple scan_input tensors are used, they must all have the same batch-size,
-  and they must all have the same maximum-sequence-length (the dimensionality of the
-  sequence axis or scan axis). The sequence axis or scan axis is required to be 1.
+  The operation supports batching. When multiple scan_input tensors are used,
+  they must all have the same batch-size, and they must all have the same
+  maximum-sequence-length (the dimensionality of the sequence axis or scan axis).
+  By default, the batch axis is 0 and the sequence axis or scan axis is 1.
+  The attribute seq_major can be used to swap the sequence axis and batch axis.
   
   The operation has an optional sequence_lens input (of shape [BATCH_SIZE]) to
   allow variable length sequences of length <= the maximum-sequence-length. If this
@@ -9112,7 +9113,9 @@ for test_name, shape in test_cases.items():
 
 #### Version
 
-This version of the operator has been available since version 8 of the default ONNX operator set.
+This version of the operator has been available since version 9 of the default ONNX operator set.
+
+Other versions of this operator: <a href="Changelog.md#Scan-8">Scan-8</a>
 
 #### Attributes
 
@@ -9123,6 +9126,8 @@ This version of the operator has been available since version 8 of the default O
 <dd>An optional list of M flags. The i-th element of the list specifies the direction to be scanned for the i-th scan_input tensor: 0 indicates forward direction and 1 indicates reverse direction. If omitted, all scan_input tensors will be scanned in the forward direction.</dd>
 <dt><tt>num_scan_inputs</tt> : int (required)</dt>
 <dd>An attribute specifying the number of scan_inputs M. </dd>
+<dt><tt>seq_major</tt> : int (default is 0)</dt>
+<dd>An optional flag. If this attribute has a value of 0, then the sequence-axis is 1 and the batch-axis is 0. If this attribute has a value of 1, then the sequence-axis is 0 and the batch-axis is 1.</dd>
 </dl>
 
 #### Inputs (2 - &#8734;)

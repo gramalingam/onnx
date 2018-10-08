@@ -193,7 +193,7 @@ ONNX_OPERATOR_SET_SCHEMA(
         .TypeConstraint("I", {"int64"}, "Only int64")
         .TypeConstraint("B", {"bool"}, "Only bool"));
 
-static const char* scan_ver1_doc = R"DOC(
+static const char* scan_ver2_doc = R"DOC(
 Scan can be used to iterate over one or more scan_input tensors,
 constructing zero or more scan_output tensors. It combines ideas from general recurrences,
 functional programming constructs such as scan, fold, map, and zip and is intended to enable
@@ -217,10 +217,11 @@ hidden-state values of RNN-like constructs).
 The scan operation returns the final values of the state_variables as well as the
 scan_outputs.
 
-The operation supports batching, and the batch-axis is required to be 0.
-When multiple scan_input tensors are used, they must all have the same batch-size,
-and they must all have the same maximum-sequence-length (the dimensionality of the
-sequence axis or scan axis). The sequence axis or scan axis is required to be 1.
+The operation supports batching. When multiple scan_input tensors are used,
+they must all have the same batch-size, and they must all have the same
+maximum-sequence-length (the dimensionality of the sequence axis or scan axis).
+By default, the batch axis is 0 and the sequence axis or scan axis is 1.
+The attribute seq_major can be used to swap the sequence axis and batch axis.
 
 The operation has an optional sequence_lens input (of shape [BATCH_SIZE]) to
 allow variable length sequences of length <= the maximum-sequence-length. If this
@@ -322,9 +323,9 @@ values are computed in the outer graph, they need to be passed in as extra state
 
 ONNX_OPERATOR_SET_SCHEMA(
 	Scan,
-	8,
+	9,
 	OpSchema()
-	.SetDoc(scan_ver1_doc)
+	.SetDoc(scan_ver2_doc)
 	.Input(
 		0,
 		"sequence_lens",
@@ -369,6 +370,14 @@ ONNX_OPERATOR_SET_SCHEMA(
 		"If omitted, all scan_input tensors will be scanned in the forward direction.",
 		AttributeProto::INTS,
 		false)
+    .Attr(
+        "seq_major",
+        "An optional flag. If this attribute has a value of 0, then the sequence-axis is 1 "
+        "and the batch-axis is 0. If this attribute has a value of 1, then the sequence-axis "
+        "is 0 and the batch-axis is 1.",
+        AttributeProto::INT,
+        static_cast<int64_t>(0)
+    )
 	.TypeConstraint("I", { "tensor(int64)" }, "Int64 tensor")
 	.TypeConstraint("V", OpSchema::all_tensor_types(), "All Tensor types"));
 
