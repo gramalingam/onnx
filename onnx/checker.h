@@ -81,12 +81,36 @@ class CheckerContext final {
       &FunctionBuilderRegistry::OnnxInstance();
 };
 
-struct LexicalScopeContext final {
-  // output_names: names defined and visible (and usable as inputs)
-  std::unordered_set<std::string> output_names;
-  // used_names: names defined elsewhere that cannot be used for new values
-  // (outputs)
-  std::unordered_set<std::string> used_names;
+class LexicalScopeContext final {
+ public:
+  // Default constructor creates a top-level lexical scope
+  LexicalScopeContext()
+      : names_in_scope(), p_used_names(new std::unordered_set<std::string>()) {}
+
+  // Copy constructor is used to construct a new lexical scope from
+  // a parent lexical scope
+  LexicalScopeContext(LexicalScopeContext& parent)
+      : names_in_scope(parent.names_in_scope),
+        p_used_names(parent.p_used_names) {}
+
+  void add_def(const std::string& name) {
+    auto result = p_used_names->insert(name);
+    if (!result.second) {
+      fail_check("Redefinition of " + name + " is invalid.");
+    }
+    names_in_scope.insert(name);
+  }
+
+  bool valid_use(const std::string& name) {
+    return names_in_scope.count(name) > 0;
+  }
+
+ private:
+  // names_in_scope: names defined previously still in scope
+  std::unordered_set<std::string> names_in_scope;
+
+  // used_names: names defined previously that cannot be used for new values
+  std::unordered_set<std::string>* p_used_names;
 };
 
 using IR_VERSION_TYPE = decltype(Version::IR_VERSION);
@@ -95,22 +119,19 @@ void check_tensor(const TensorProto& tensor, const CheckerContext&);
 void check_attribute(
     const AttributeProto& attr,
     const CheckerContext&,
-    const LexicalScopeContext&,
-    std::unordered_set<std::string>&);
+    LexicalScopeContext&);
 void check_node(
     const NodeProto& node,
     const CheckerContext&,
-    const LexicalScopeContext&,
-    std::unordered_set<std::string>&);
+    LexicalScopeContext&);
 void check_graph(
     const GraphProto& graph,
     const CheckerContext&,
-    const LexicalScopeContext&,
-    std::unordered_set<std::string>&);
+    LexicalScopeContext&);
 void check_function(
     const FunctionProto& function,
     const CheckerContext&,
-    const LexicalScopeContext&);
+    LexicalScopeContext&);
 
 void check_model(const ModelProto& model);
 
@@ -118,7 +139,7 @@ void VerifyFunctionNode(
     const NodeProto&,
     const FunctionProto&,
     const CheckerContext&,
-    const LexicalScopeContext&);
+    LexicalScopeContext&);
 
 } // namespace checker
 } // namespace ONNX_NAMESPACE
