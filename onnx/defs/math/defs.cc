@@ -722,20 +722,26 @@ ONNX_OPERATOR_SET_SCHEMA(
             "Input tensor A. "
             "The shape of A should be (M, K) if transA is 0, "
             "or (K, M) if transA is non-zero.",
-            "T")
+            "T",
+            OpSchema::Single,
+            false)
         .Input(
             1,
             "B",
             "Input tensor B. "
             "The shape of B should be (K, N) if transB is 0, "
             "or (N, K) if transB is non-zero.",
-            "T")
+            "T",
+            OpSchema::Single,
+            false)
         .Input(
             2,
             "C",
             "Input tensor C. "
             "The shape of C should be unidirectional broadcastable to (M, N).",
-            "T")
+            "T",
+            OpSchema::Single,
+            false)
         .Output(0, "Y", "Output tensor of shape (M, N).", "T")
         .TypeConstraint(
             "T",
@@ -745,7 +751,14 @@ ONNX_OPERATOR_SET_SCHEMA(
              "tensor(uint32)",
              "tensor(uint64)",
              "tensor(int32)",
-             "tensor(int64)"},
+             "tensor(int64)",
+             "sparse(float16)",
+             "sparse(float)",
+             "sparse(double)",
+             "sparse(uint32)",
+             "sparse(uint64)",
+             "sparse(int32)",
+             "sparse(int64)"},
             "Constrain input and output types to float/int tensors.")
         .Attr(
             "transA",
@@ -768,6 +781,10 @@ ONNX_OPERATOR_SET_SCHEMA(
             AttributeProto::FLOAT,
             1.0f)
         .TypeAndShapeInferenceFunction([](InferenceContext& ctx) {
+          // get elt-type; check it;
+          // determine whether output is sparse or dense;
+          // propagate both;
+          // handle shapes
           propagateElemTypeFromInputToOutput(ctx, 0, 0);
           if (hasNInputShapes(ctx, 2)) {
             auto transAAttr = ctx.getAttribute("transA");
