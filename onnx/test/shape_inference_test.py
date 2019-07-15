@@ -538,6 +538,19 @@ class TestShapeInference(unittest.TestCase):
                          make_tensor('axes', TensorProto.INT64, (1,), (1,))])
         self._assert_inferred(graph, [make_tensor_value_info('y', TensorProto.FLOAT, ("a", 1))])  # type: ignore
 
+    def test_slice_variable_nocopy(self):  # type: () -> None
+        graph = self._make_graph(
+            [('x', TensorProto.FLOAT, ("a", 2)),
+             ('starts', TensorProto.INT64, (1,)),
+             ('ends', TensorProto.INT64, (1,)),
+             ('axes', TensorProto.INT64, (1,))],
+            [make_node('Slice', ['x', 'starts', 'ends', 'axes'], 'y')],
+            [],
+            initializer=[make_tensor('starts', TensorProto.INT64, (1,), (1,)),
+                         make_tensor('ends', TensorProto.INT64, (1,), (200,)),
+                         make_tensor('axes', TensorProto.INT64, (1,), (0,))])
+        self._assert_inferred(graph, [make_tensor_value_info('y', TensorProto.FLOAT, (None, 2))])  # type: ignore
+
     def test_slice_variable_input_types(self):  # type: () -> None
         graph = self._make_graph(
             [('x', TensorProto.DOUBLE, (3, 2)),

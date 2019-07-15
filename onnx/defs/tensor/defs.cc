@@ -527,13 +527,13 @@ ONNX_OPERATOR_SET_SCHEMA(
           const TensorProto* startsInitializer = ctx.getInputData(1);
           const TensorProto* endsInitializer = ctx.getInputData(2);
           const TensorProto* axesInitializer =
-              hasInputShape(ctx, 3) ? ctx.getInputData(3) : nullptr;
+              (hasInput(ctx, 3)) ? ctx.getInputData(3) : nullptr;
           const TensorProto* stepsInitializer =
-              hasInputShape(ctx, 4) ? ctx.getInputData(4) : nullptr;
+              (hasInput(ctx, 4)) ? ctx.getInputData(4) : nullptr;
 
           if (!startsInitializer || !endsInitializer ||
-              (hasInputShape(ctx, 3) && !ctx.getInputData(3)) ||
-              (hasInputShape(ctx, 4) && !ctx.getInputData(4))) {
+              (hasInput(ctx, 3) && !ctx.getInputData(3)) ||
+              (hasInput(ctx, 4) && !ctx.getInputData(4))) {
             return;
           }
 
@@ -596,19 +596,11 @@ ONNX_OPERATOR_SET_SCHEMA(
             }
           }
 
-          for (size_t i = 0; (int64_t)i < input_rank; ++i) {
-            // first update rank of output dim
-            auto* output_dim = ctx.getOutputType(0)
-                                   ->mutable_tensor_type()
-                                   ->mutable_shape()
-                                   ->add_dim();
-            const auto& input_dim = input_shape.dim((int)i);
-            if (input_dim.has_dim_value()) {
-              output_dim->set_dim_value(input_dim.dim_value());
-            } else if (input_dim.has_dim_param()) {
-              output_dim->set_dim_param(input_dim.dim_param());
-            }
-          }
+          // Copy input shape to output shape first:
+          updateOutputShape(ctx, 0, input_shape);
+
+          // Update sliced dimensions:
+          auto* output_shape = getOutputShape(ctx, 0);
 
           std::unordered_set<int64_t> unique_axes;
           size_t axes_size = axes.size();
@@ -625,13 +617,16 @@ ONNX_OPERATOR_SET_SCHEMA(
 
             unique_axes.insert(axis);
 
-            auto input_dim =
-                ctx.getInputType(0)->tensor_type().shape().dim((int)axis);
+            auto input_dim = input_shape.dim((int)axis);
 
             // input dim value is missing - cannot perform shape inference for
             // this axis
-            if (!input_dim.has_dim_value())
+            if (!input_dim.has_dim_value()) {
+              // clear any dim param created by original copy above:
+              // cannot say anything about this dimension's output size
+              output_shape->mutable_dim((int)axis)->clear_dim_param();
               continue;
+            }
 
             const auto input_dim_value = input_dim.dim_value();
 
@@ -664,11 +659,7 @@ ONNX_OPERATOR_SET_SCHEMA(
               temp = 0;
 
             // assign output value
-            ctx.getOutputType(0)
-                ->mutable_tensor_type()
-                ->mutable_shape()
-                ->mutable_dim((int)axis)
-                ->set_dim_value(temp);
+            output_shape->mutable_dim((int)axis)->set_dim_value(temp);
           }
         }));
 
@@ -1355,8 +1346,7 @@ ONNX_OPERATOR_SET_SCHEMA(
         .SetDoc(Upsample_ver10_doc)
         .TypeAndShapeInferenceFunction([](InferenceContext& ctx) {
           resizeShapeInference(ctx);
-        })
-);
+        }));
 
 static const char* Resize_ver10_doc = R"DOC(
 Resize the input tensor.
@@ -1388,10 +1378,8 @@ ONNX_OPERATOR_SET_SCHEMA(
             "Constrain input 'X' and output 'Y' to all tensor types.")
         .SetDoc(Resize_ver10_doc)
         .TypeAndShapeInferenceFunction([](InferenceContext& ctx) {
-           resizeShapeInference(ctx);
-        })
-);
-
+          resizeShapeInference(ctx);
+        }));
 
 ONNX_OPERATOR_SET_SCHEMA(
     Identity,

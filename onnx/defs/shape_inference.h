@@ -257,6 +257,10 @@ inline void propagateElemTypeFromDtypeToOutput(
       ctx, attribute_tensor_datatype, outputIndex);
 }
 
+inline bool hasInput(InferenceContext& ctx, size_t n) {
+  return ctx.getNumInputs() > static_cast<size_t>(n) && ctx.getInputType(n);
+}
+
 inline bool hasInputShape(InferenceContext& ctx, size_t n) {
   return ctx.getNumInputs() > static_cast<size_t>(n) && ctx.getInputType(n) &&
       ctx.getInputType(n)->has_tensor_type() &&
