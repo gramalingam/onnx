@@ -25,6 +25,9 @@
 #include "onnx/onnx-operators_pb.h"
 namespace ONNX_NAMESPACE {
 
+class FunctionBodyQueryContext { /* TODO */ };
+using DynamicFunctionBodyFunction = std::function<std::vector<NodeProto>(FunctionBodyQueryContext&)>;
+
 class SchemaError final : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
@@ -619,6 +622,17 @@ class OpSchema final {
 
   OpSchema& FunctionBody(const std::vector<NodeProto>& func_nodes);
 
+  OpSchema& DynamicFunctionBody(DynamicFunctionBodyFunction f) {
+    dynamic_function_body_fn_ = f;
+  }
+
+  std::vector<NodeProto> GetDynamicNodes(FunctionBodyQueryContext& ctx) {
+    if (dynamic_function_body_fn_) {
+      return dynamic_function_body_fn_(ctx);
+    } else
+      return {};
+  }
+
   const FunctionProto* GetFunction() const;
 
   // Verifies that the schema is valid and all specifications are compatible.
@@ -657,6 +671,7 @@ class OpSchema final {
   std::function<bool(int)> num_inputs_allowed_ = [](int) { return true; };
   std::function<bool(int)> num_outputs_allowed_ = [](int) { return true; };
   InferenceFunction tensor_inference_function_;
+  DynamicFunctionBodyFunction dynamic_function_body_fn_;
   FunctionProto function_body_;
 };
 
