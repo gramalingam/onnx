@@ -140,5 +140,9 @@ void check_function(
 void check_model(const ModelProto& model);
 void check_model(const std::string& model_path);
 
+// An experimental version to recommend the minimum recommended ir-version for a
+// model.
+IR_VERSION_TYPE get_min_ir_version(const ModelProto& model);
+
 } // namespace checker
 } // namespace ONNX_NAMESPACE
