@@ -258,6 +258,17 @@ class TestHelperNodeFunctions(unittest.TestCase):
         self.assertFalse(hasattr(model_def, "name"))
         self.assertEqual(model_def.doc_string, 'test')
 
+    def test_model_irversion(self):  # type: () -> None
+        def test(opset_version, ir_version):  # type: (int, int) -> None
+            graph = helper.make_graph([], "my graph", [], [])
+            model = helper.make_model_gen_version(graph, opset_imports=[helper.make_opsetid("", opset_version)])
+            self.assertEqual(model.ir_version, ir_version)
+        # opset version 9 requires minimum ir_version 4, etc.
+        test(9, 4)
+        test(10, 5)
+        test(11, 6)
+        test (12, 7)
+
     def test_model_metadata_props(self):  # type: () -> None
         graph = helper.make_graph([], "my graph", [], [])
         model_def = helper.make_model(graph, doc_string='test')
