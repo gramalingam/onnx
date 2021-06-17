@@ -6,7 +6,7 @@
 * [Overall Test Coverage](#overall-test-coverage)
 # Node Test Coverage
 ## Summary
-Node tests have covered 149/163 (91.41%, 5 generators excluded) common operators.
+Node tests have covered 150/164 (91.46%, 5 generators excluded) common operators.
 
 Node tests have covered 0/0 (N/A) experimental operators.
 
@@ -1323,12 +1323,12 @@ There are 2 test cases, listed as following:
 <summary>batchnormalization</summary>
 
 ```python
-# input size: (1, 2, 1, 3)
-x = np.array([[[[-1, 0, 1]], [[2, 3, 4]]]]).astype(np.float32)
-s = np.array([1.0, 1.5]).astype(np.float32)
-bias = np.array([0, 1]).astype(np.float32)
-mean = np.array([0, 3]).astype(np.float32)
-var = np.array([1, 1.5]).astype(np.float32)
+# input size: (2, 3, 4, 5)
+x = np.random.randn(2, 3, 4, 5).astype(np.float32)
+s = np.random.randn(3).astype(np.float32)
+bias = np.random.randn(3).astype(np.float32)
+mean = np.random.randn(3).astype(np.float32)
+var = np.random.rand(3).astype(np.float32)
 y = _batchnorm_test_mode(x, s, bias, mean, var).astype(np.float32)
 
 node = onnx.helper.make_node(
@@ -1337,7 +1337,7 @@ node = onnx.helper.make_node(
     outputs=['y'],
 )
 
-# output size: (1, 2, 1, 3)
+# output size: (2, 3, 4, 5)
 expect(node, inputs=[x, s, bias, mean, var], outputs=[y],
        name='test_batchnorm_example')
 
@@ -1367,27 +1367,27 @@ expect(node, inputs=[x, s, bias, mean, var], outputs=[y],
 <summary>train</summary>
 
 ```python
-# input size: (1, 2, 1, 3)
-x = np.array([[[[-1, 0, 1]], [[2, 3, 4]]]]).astype(np.float32)
-s = np.array([1.0, 1.5]).astype(np.float32)
-bias = np.array([0, 1]).astype(np.float32)
-mean = np.array([0, 3]).astype(np.float32)
-var = np.array([1, 1.5]).astype(np.float32)
+# input size: (2, 3, 4, 5)
+x = np.random.randn(2, 3, 4, 5).astype(np.float32)
+s = np.random.randn(3).astype(np.float32)
+bias = np.random.randn(3).astype(np.float32)
+mean = np.random.randn(3).astype(np.float32)
+var = np.random.rand(3).astype(np.float32)
 # using np.bool(1) while generating test data with "'bool' object has no attribute 'dtype'"
 # working around by using np.byte(1).astype(bool)
 training_mode = 1
-y, saved_mean, saved_var, output_mean, output_var = _batchnorm_training_mode(x, s, bias, mean, var)
+y, output_mean, output_var = _batchnorm_training_mode(x, s, bias, mean, var)
 
 node = onnx.helper.make_node(
     'BatchNormalization',
     inputs=['x', 's', 'bias', 'mean', 'var'],
-    outputs=['y', 'output_mean', 'output_var', 'saved_mean', 'saved_var'],
+    outputs=['y', 'output_mean', 'output_var'],
     training_mode=training_mode
 )
 
-# output size: (1, 2, 1, 3)
+# output size: (2, 3, 4, 5)
 expect(node, inputs=[x, s, bias, mean, var],
-       outputs=[y, output_mean, output_var, saved_mean, saved_var],
+       outputs=[y, output_mean, output_var],
        name='test_batchnorm_example_training_mode')
 
 # input size: (2, 3, 4, 5)
@@ -1399,21 +1399,76 @@ var = np.random.rand(3).astype(np.float32)
 training_mode = 1
 momentum = 0.9
 epsilon = 1e-2
-y, saved_mean, saved_var, output_mean, output_var = _batchnorm_training_mode(x, s, bias, mean, var, momentum,
-                                                                            epsilon)
+y, output_mean, output_var = _batchnorm_training_mode(x, s, bias, mean, var, momentum,
+                                                      epsilon)
 
 node = onnx.helper.make_node(
     'BatchNormalization',
     inputs=['x', 's', 'bias', 'mean', 'var'],
-    outputs=['y', 'output_mean', 'output_var', 'saved_mean', 'saved_var'],
+    outputs=['y', 'output_mean', 'output_var'],
     epsilon=epsilon,
     training_mode=training_mode
 )
 
 # output size: (2, 3, 4, 5)
 expect(node, inputs=[x, s, bias, mean, var],
-       outputs=[y, output_mean, output_var, saved_mean, saved_var],
+       outputs=[y, output_mean, output_var],
        name='test_batchnorm_epsilon_training_mode')
+```
+
+</details>
+
+
+### Bernoulli
+There are 3 test cases, listed as following:
+<details>
+<summary>bernoulli_with_dtype</summary>
+
+```python
+node = onnx.helper.make_node(
+    'Bernoulli',
+    inputs=['x'],
+    outputs=['y'],
+    dtype=onnx.TensorProto.DOUBLE,
+)
+
+x = np.random.uniform(0.0, 1.0, 10).astype(np.float32)
+y = bernoulli_reference_implementation(x, np.float64)
+expect(node, inputs=[x], outputs=[y], name='test_bernoulli_double')
+```
+
+</details>
+<details>
+<summary>bernoulli_with_seed</summary>
+
+```python
+seed = np.float(0)
+node = onnx.helper.make_node(
+    'Bernoulli',
+    inputs=['x'],
+    outputs=['y'],
+    seed=seed,
+)
+
+x = np.random.uniform(0.0, 1.0, 10).astype(np.float32)
+y = bernoulli_reference_implementation(x, np.float32)
+expect(node, inputs=[x], outputs=[y], name='test_bernoulli_seed')
+```
+
+</details>
+<details>
+<summary>bernoulli_without_dtype</summary>
+
+```python
+node = onnx.helper.make_node(
+    'Bernoulli',
+    inputs=['x'],
+    outputs=['y'],
+)
+
+x = np.random.uniform(0.0, 1.0, 10).astype(np.float)
+y = bernoulli_reference_implementation(x, np.float)
+expect(node, inputs=[x], outputs=[y], name='test_bernoulli')
 ```
 
 </details>
@@ -2516,7 +2571,7 @@ W = np.array([[[[1., 1., 1.],  # (1, 2, 3, 3)
                 [1., 1., 1.],
                 [1., 1., 1.]]]]).astype(np.float32)
 
-node = onnx.helper.make_node("ConvTranspose", ["X", "W"], ["Y"], auto_pad="SAME_LOWER", strides=[2, 2])
+node = onnx.helper.make_node("ConvTranspose", ["X", "W"], ["Y"], auto_pad="SAME_UPPER", strides=[2, 2])
 
 y = np.array([[[[0., 0., 1., 1., 3., 2.],
                 [0., 0., 1., 1., 3., 2.],
@@ -4314,10 +4369,7 @@ node = onnx.helper.make_node(
     outputs=['y'],
 )
 x = np.random.randn(1, 3, 5, 5).astype(np.float32)
-spatial_shape = np.ndim(x) - 2
-y = np.average(x, axis=tuple(range(spatial_shape, spatial_shape + 2)))
-for _ in range(spatial_shape):
-    y = np.expand_dims(y, -1)
+y = np.mean(x, axis=tuple(range(2, np.ndim(x))), keepdims=True)
 expect(node, inputs=[x], outputs=[y], name='test_globalaveragepool')
 ```
 
@@ -4357,10 +4409,7 @@ node = onnx.helper.make_node(
     outputs=['y'],
 )
 x = np.random.randn(1, 3, 5, 5).astype(np.float32)
-spatial_shape = np.ndim(x) - 2
-y = np.max(x, axis=tuple(range(spatial_shape, spatial_shape + 2)))
-for _ in range(spatial_shape):
-    y = np.expand_dims(y, -1)
+y = np.max(x, axis=tuple(range(2, np.ndim(x))), keepdims=True)
 expect(node, inputs=[x], outputs=[y], name='test_globalmaxpool')
 ```
 
@@ -4765,8 +4814,7 @@ data = [
         [1, 5],
     ]]], dtype=np.float32)]
 
-expect(node, inputs=[data], outputs=[data], name='test_identity_sequence',
-    opset_imports=[onnx.helper.make_opsetid("", 13)])
+expect(node, inputs=[data], outputs=[data], name='test_identity_sequence')
 ```
 
 </details>
@@ -4837,8 +4885,8 @@ expect(if_node, inputs=[cond], outputs=[res], name='test_if',
 # Given a bool scalar input cond.
 # return constant sequence x if cond is True, otherwise return constant sequence y.
 
-then_out = onnx.helper.make_sequence_value_info('then_out', onnx.TensorProto.FLOAT, shape=[5])
-else_out = onnx.helper.make_sequence_value_info('else_out', onnx.TensorProto.FLOAT, shape=[5])
+then_out = onnx.helper.make_tensor_sequence_value_info('then_out', onnx.TensorProto.FLOAT, shape=[5])
+else_out = onnx.helper.make_tensor_sequence_value_info('else_out', onnx.TensorProto.FLOAT, shape=[5])
 
 x = [np.array([1, 2, 3, 4, 5]).astype(np.float32)]
 y = [np.array([5, 4, 3, 2, 1]).astype(np.float32)]
@@ -5579,8 +5627,8 @@ expect(node, inputs=[trip_count, cond, y], outputs=[res_y, res_scan],
 # Return a sequence of tensors of
 #   [[x1], [x1, x2], ..., [x1, ..., xN]]
 
-seq_in = onnx.helper.make_sequence_value_info('seq_in', onnx.TensorProto.FLOAT, None)
-seq_out = onnx.helper.make_sequence_value_info('seq_out', onnx.TensorProto.FLOAT, None)
+seq_in = onnx.helper.make_tensor_sequence_value_info('seq_in', onnx.TensorProto.FLOAT, None)
+seq_out = onnx.helper.make_tensor_sequence_value_info('seq_out', onnx.TensorProto.FLOAT, None)
 cond_in = onnx.helper.make_tensor_value_info('cond_in', onnx.TensorProto.BOOL, [])
 cond_out = onnx.helper.make_tensor_value_info('cond_out', onnx.TensorProto.BOOL, [])
 iter_count = onnx.helper.make_tensor_value_info('iter_count', onnx.TensorProto.INT64, [])
