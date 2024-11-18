@@ -106,7 +106,7 @@ Consider the example of an `Add (Input1, Input2)` op. Consider the case where `I
 
 The figure below shows how we can use sharding for both the `M` and `N` axes:
 
-![Composing sharding specs on different axes](images/composing_broadcast_axes)
+![Composing sharding specs on different axes](images/composing_broadcast_axes.png)
 
 Note that in this example, both the `M` and `N` axes are split into two shards each.
 This means that the output itself has 4 shards, as shown in the figure.
