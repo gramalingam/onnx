@@ -101,6 +101,7 @@ In the special case where all corresponding input axes have a size of 1, the out
 the same sharding (that is, replicated across all devices of the node op).
 
 **Composing Sharding Specs on Different Axes**
+
 Consider the example of an `Add (Input1, Input2)` op. Consider the case where `Input1` has shape `[M, 1]` and
 `Input2` has shape `[1, N]`. The output has shape `[M, N]`, as a result of broadcasting.
 
