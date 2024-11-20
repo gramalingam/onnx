@@ -184,7 +184,7 @@ This rule is extended to the case of more than two broadcast axes accordingly.
 **Constraints on input sharding**
 * No constraints on input sharding.
 * Sharding along non-reduction axes is straightforward. It indicates
-parallelization of the iteration over the non-reduction axes, and is straightforward.
+parallelization of the iteration over the non-reduction axes.
 * Sharding along reduction axes is permitted. It indicates parallelization of the reduction
 loop, but this involves performing the reduction in two steps. In the first step, the
 reduction is done locally on the shard, and in the second step the reduction is done
