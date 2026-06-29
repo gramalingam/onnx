@@ -129,6 +129,46 @@ Models that compute output shapes via `Ceil(input_size / stride)` can now have t
 ## Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
 
+This section is intentionally split into two parts:
+
+1. **What is a valid shape annotation, and what does it mean?**
+2. **How do checking and inference use annotations, and how can users extend that behavior?**
+
+### Part 1: Valid shape-annotation syntax and meaning
+
+The `dim_param` field is used to encode symbolic shape annotations as strings. A valid annotation expression is one of:
+
+1. A non-negative integer literal.
+2. A symbolic identifier.
+3. A function-call expression: `function-name ( comma-separated-expression-list )`, where `function-name` is any symbolic identifier.
+4. A binary infix expression: `expression binary-op expression`.
+
+Equivalent grammar (informal EBNF):
+
+```
+expr      ::= int_lit
+           | ident
+           | ident "(" [expr {"," expr}] ")"
+           | expr bin_op expr
+
+bin_op    ::= "+" | "-" | "*" | "/"
+int_lit   ::= "0" | nonzero_digit {digit}
+ident     ::= identifier token used for dim_param symbols
+```
+
+Binary operators are restricted to the operators listed in ONNX for symbolic dimension arithmetic, with parser precedence:
+
+1. `*`, `/` (higher precedence)
+2. `+`, `-` (lower precedence)
+
+Operators at the same precedence level associate left-to-right.
+
+Function names include predefined names standardized by ONNX (for example, `ceil`, `floor`, and `broadcast`), and may also include names corresponding to arithmetic operators as a syntactic shortcut (for example, `add(x, y)` as an alternative to `x + y`).
+
+Users may use function names outside the predefined list. Such calls are treated as **uninterpreted functions**: they are valid syntax and may be carried through inference/checking symbolically, but ONNX core does not assign them additional built-in algebraic simplification rules.
+
+The meaning of an annotation is thus the integer-valued symbolic expression denoted by this grammar under ONNX dimension semantics (non-negative integer dimensions, integer arithmetic for shape formulas, and operator/function semantics where predefined behavior exists).
+
 ### C++ helper API (`onnx/defs/shape_inference.h`)
 
 Three new utility functions are added:
@@ -172,6 +212,48 @@ Expressions are infix strings using standard C-like syntax:
 - Division `/` is integer division (floor towards zero), matching ONNX semantic for shape dimensions.
 - No simplification is performed (e.g., `"0 + A"` is left as-is rather than being reduced to `"A"`).
 
+### Part 2: Inference and checking, with extensibility hooks
+
+Part 2 addresses two related sub-problems:
+
+1. **Inference**: when shape annotations are missing, infer and propagate symbolic expressions.
+2. **Checking**: when annotations are present, verify consistency with inferred constraints.
+
+The baseline behavior remains as described in this proposal: expression strings are propagated, merged, and unified conservatively.
+
+To support more sophisticated symbolic reasoning without breaking existing callers, this proposal adds an extensibility mechanism through new virtual methods on `InferenceContext` with default implementations.
+
+Conceptually:
+
+```cpp
+class InferenceContext {
+ public:
+  // Existing interface omitted.
+
+  // Called when two symbolic-expression strings are required to be equal.
+  // Returns the preferred canonical representative for the unified class.
+  // Default implementation preserves current behavior (string-oriented, lenient).
+  virtual std::string unify(const std::string& lhs, const std::string& rhs);
+
+  // Optional future hooks may be added similarly, for example:
+  // normalize(expr), areEquivalent(a, b), makeFunction(name, args), etc.
+};
+```
+
+Default behavior:
+
+- Maintains backward compatibility with current ONNX shape inference semantics.
+- May choose a preferred representative (for example, preserve target-side string).
+- Throws `ShapeInferenceError` when it can prove two expressions cannot be equal.
+- May track constraints implied by successful equalities across multiple calls.
+
+Custom behavior:
+
+- A user-provided `InferenceContext` subclass can override `unify` to implement stronger reasoning (canonicalization, solver-backed equivalence checks, domain-specific constraints, contradiction detection).
+- Core ONNX inference/checking helpers call through this virtual method when symbolic equality is required, so custom logic is automatically applied.
+
+This design provides extensibility for both custom operators and custom reasoning policies while keeping the default path dependency-free and compatible.
+
 ### Symbol generation
 
 `SymbolTable::createNew()` now uses prefix `"_d"` by default, generating names `_d0`, `_d1`, … The old prefix `unk__` is no longer used by the built-in implementation.
@@ -190,9 +272,9 @@ The following operators now have `PartialDataPropagationFunction` implementation
 | `Range` | Propagates the generated range as partial data for downstream use |
 
 
-### Unification of symbolic expressions
+### Baseline unification of symbolic expressions
 
-Shape inference frequently needs to *unify* two dimensions—asserting that they must be equal. The two relevant functions are
+Shape inference frequently needs to *unify* two dimensions, asserting they must be equal. In the default implementation, the two relevant functions are
 `unifyDim` (`onnx/defs/shape_inference.h`) and `mergeInDimensionInfo` (`onnx/defs/shape_inference.h`).
 Both follow the same priority rules:
 
@@ -206,7 +288,7 @@ Both follow the same priority rules:
 | symbolic `dim_param` | unknown | set target to source's `dim_param` string |
 | unknown | any | preserve target |
 
-The critical row is **symbolic ↔ symbolic**: the implementation does **not** check whether the two expression
+The critical row is **symbolic ↔ symbolic**: the baseline implementation does **not** check whether the two expression
 strings are algebraically equivalent. It simply keeps whichever string is already on the target side and
 discards the source. This means:
 
@@ -221,12 +303,9 @@ succeed—the target string `"N"` is kept and `"N + 1"` is discarded without any
 The checker (`onnx.checker`) will likewise not flag this situation, because `dim_param` strings are treated
 as opaque identifiers rather than expressions to be evaluated.
 
-Performing algebraic equality or consistency checking would require a full symbolic solver (out of scope for
-ONNX shape inference). The design choice prioritises leniency (no spurious failures on valid models) over
-strictness (early detection of contradictory shape constraints). The trade-off is that inferred shapes may be
-weaker than theoretically possible in cases where two independently-derived expressions describe the same
-dimension, and genuine shape mismatches between symbolic expressions will only surface at runtime rather than
-during shape inference.
+Performing algebraic equality or consistency checking may require a symbolic solver. The default ONNX behavior
+therefore prioritises leniency (no spurious failures on valid models) over strictness (early contradiction
+detection). The extensibility hook above allows advanced users to opt into stricter or smarter behavior.
 
 **Implication for new operator implementations.** When writing or updating a shape-inference function that asserts
 two dimensions must be equal (e.g., batch size must match across two inputs), prefer using `unifyDim(input_dim, output_dim)`
@@ -334,13 +413,17 @@ A proper CAS (computer algebra system) would support simplification, factoring, 
 
 An earlier design considered adding a `dim_expr` field to the protobuf. This would be unambiguous and parser-friendly, but requires coordinated changes to the ONNX IR spec, all language bindings, and all downstream tools. The string encoding chosen here defers that specification work to a future version.
 
-### Why not introduce a pluggable dimension-algebra abstraction?
+### Why extensibility via `InferenceContext` virtual methods?
 
-A natural extension would be to define a `DimensionAlgebra` class or interface with virtual methods covering arithmetic (`+`, `-`, `*`, `/`), unary functions (`ceil`, `floor`, `broadcast`, …), and unification/equality checking. The current string-based implementation would be the default; users who need stricter equality checking (e.g., raising an error when `"N"` is unified with `"N+1"`) or a richer simplification strategy (e.g., a CAS backend) could plug in their own implementation.
+This proposal keeps the current string-based core while adding virtual hooks on `InferenceContext` (for example, `unify`) as the primary extension point.
 
-Such an abstraction is feasible. The primary cost is **API surface**: every shape-inference helper that currently calls `dimToString` or uses the `Dim` arithmetic operators would need to be threaded with a reference to the active algebra object, and the `InferenceContext` interface would need a new virtual accessor. This is a moderate but non-trivial refactor, and it couples the algebra strategy to the shape-inference pass's call graph.
+Compared with introducing a full pluggable `DimensionAlgebra` abstraction immediately, this approach:
 
-The decision here is to defer this to a follow-on extension (see Future possibilities) to keep the scope of this RFC manageable and the initial implementation reviewable in a single PR. The string-based default remains fully backward compatible and can be adopted by all existing callers without change. A pluggable interface can be layered on top once the design has stabilised.
+- Minimizes API churn and refactoring in existing shape-inference helpers.
+- Preserves full backward compatibility with existing behavior by default.
+- Provides a practical path for advanced users to inject stronger symbolic reasoning now.
+
+A broader algebra abstraction remains possible in the future if needed, but is not required to provide immediate extensibility for checking and inference.
 
 ### What is the impact of not doing this?
 
@@ -367,7 +450,7 @@ Exporters fall back to generating fully unknown shapes for almost every operator
 ## Future possibilities
 [future-possibilities]: #future-possibilities
 
-- **Pluggable dimension-algebra interface**: Introduce a `DimensionAlgebra` abstract class whose virtual methods cover all arithmetic operators, unary symbolic functions (`ceil`, `floor`, `broadcast`, …), and unification/equality checking. `InferenceContext` would expose an accessor for the active algebra, and the existing string-based implementation would remain the default. Third-party users who require stricter unification semantics (e.g., throwing an error when two symbolically-inequivalent expressions are unified) or a richer simplification backend (e.g., a CAS library) could supply their own subclass without modifying ONNX core.
+- **Additional `InferenceContext` hooks**: Extend the virtual API beyond `unify` (for example, normalization, equivalence checking, and symbolic-function construction) so custom reasoning engines can integrate incrementally while preserving default behavior.
 - **Constraint propagation**: Allow users to assert that two symbolic dimensions are equal or that one is a multiple of another, enabling downstream inference to resolve more shapes statically.
 - **Extended operator coverage**: Add `PartialDataPropagationFunction` to more operators (e.g., `Transpose`, `Gather`, `ScatterElements`) to propagate symbolic shape information further through shape-computation subgraphs.
 - **Simplification pass**: Provide an optional pass that simplifies expression strings (e.g., folds `N - 0` to `N`, `N * 1` to `N`) to keep shapes readable.
