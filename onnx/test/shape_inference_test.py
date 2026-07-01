@@ -6945,24 +6945,51 @@ class TestShapeInference(TestShapeInferenceHelper):
         )
 
     def test_loop(self) -> None:
-        model = onnx.parser.parse_model(
-            """
-            <ir_version: 8, opset_import: ["" : 13]>
-            test_loop (int64[1] max_trip_count, float[1] cond_orig, float[2] loop_state_orig, float[3] outer_scope_input) => (float final_state, float[?, 3] scan_result)
-            {
-                loop_state_final, loop_output = Loop <body = subgraph (int64[1] iter_num_in, ? cond_in, ? loop_state_in) => (? cond_out, ? loop_state_out, float[3] output)
-                {
-                    cond_out = Identity(cond_in)
-                    loop_state_out = Identity(loop_state_in)
-                    output = Identity(outer_scope_input)
-                }>(max_trip_count, cond_orig, loop_state_orig)
-                final_state = Identity(loop_state_final)
-                scan_result = Identity(loop_output)
-            }
-            """
+        # can't use self._make_graph for the subgraph as it add more inputs for the Reshape operations it inserts.
+        # this breaks the subgraph inferencing as it expects the number of inputs passed from Loop to match
+        # the GraphProto, but Loop knows nothing about the additional inputs.
+        input_value_infos = [
+            make_tensor_value_info("iter_num_in", TensorProto.INT64, (1,)),
+            make_tensor_value_info("cond_in", TensorProto.UNDEFINED, None),
+            make_tensor_value_info("loop_state_in", TensorProto.UNDEFINED, ()),
+        ]
+        output_value_infos = [
+            make_tensor_value_info("cond_out", TensorProto.UNDEFINED, None),
+            make_tensor_value_info("loop_state_out", TensorProto.UNDEFINED, None),
+            make_tensor_value_info("output", TensorProto.FLOAT, (3,)),
+        ]
+
+        subgraph = helper.make_graph(
+            [
+                make_node("Identity", ["cond_in"], ["cond_out"]),
+                make_node("Identity", ["loop_state_in"], ["loop_state_out"]),
+                make_node("Identity", ["outer_scope_input"], ["output"]),
+            ],
+            "subgraph",
+            input_value_infos,
+            output_value_infos,
         )
+
+        graph = self._make_graph(
+            [
+                ("max_trip_count", TensorProto.INT64, (1,)),
+                ("cond_orig", TensorProto.FLOAT, (1,)),
+                ("loop_state_orig", TensorProto.FLOAT, (2,)),
+                ("outer_scope_input", TensorProto.FLOAT, (3,)),
+            ],
+            [
+                make_node(
+                    "Loop",
+                    ["max_trip_count", "cond_orig", "loop_state_orig"],
+                    ["loop_state_final", "loop_output"],
+                    body=subgraph,
+                )
+            ],
+            [],
+        )
+
         self._assert_inferred(
-            model,
+            graph,
             [
                 make_tensor_value_info(
                     "loop_state_final", TensorProto.FLOAT, None
@@ -7013,59 +7040,27 @@ class TestShapeInference(TestShapeInferenceHelper):
         )
 
     def test_loop_with_constant_trip_count_and_early_exit(self) -> None:
-        trip_count = 5
-        subgraph = helper.make_graph(
-            [
-                make_node(
-                    "Constant",
-                    [],
-                    ["cond_out"],
-                    value=make_tensor("cond_out_value", TensorProto.BOOL, (), (False,)),
-                ),
-                make_node("Identity", ["outer_scope_input"], ["output"]),
-            ],
-            "subgraph",
-            [
-                make_tensor_value_info("iter_num_in", TensorProto.INT64, ()),
-                make_tensor_value_info("cond_in", TensorProto.BOOL, ()),
-            ],
-            [
-                make_tensor_value_info("cond_out", TensorProto.BOOL, ()),
-                make_tensor_value_info("output", TensorProto.FLOAT, (3,)),
-            ],
+        model = onnx.parser.parse_model(
+            """
+            <ir_version: 8, opset_import: ["" : 13]>
+            test () => ()
+               <int64 max_trip_count = {5}, bool cond_orig = {1}, float[3] outer_scope_input = {1, 2, 3}>
+            {
+               loop_output = Loop (max_trip_count, cond_orig) <body: graph = subgraph (int64 iter_num_in, bool cond_in) => (bool cond_out, float[3] output) {
+                  cond_out = Constant <value: tensor = bool cond_out_value {0}> ()
+                  output = Identity (outer_scope_input)
+               }>
+            }
+            """
         )
-
-        graph = helper.make_graph(
-            [
-                make_node(
-                    "Loop",
-                    ["max_trip_count", "cond_orig"],
-                    ["loop_output"],
-                    body=subgraph,
-                )
-            ],
-            "test",
-            [],
-            [],
-            initializer=[
-                make_tensor("max_trip_count", TensorProto.INT64, (), (trip_count,)),
-                make_tensor("cond_orig", TensorProto.BOOL, (), (True,)),
-                make_tensor(
-                    "outer_scope_input", TensorProto.FLOAT, (3,), (1.0, 2.0, 3.0)
-                ),
-            ],
-        )
-
-        inferred_model = self._inferred(graph, data_prop=True)
+        inferred_model = self._inferred(model, data_prop=True)
         loop_output = next(
             value_info
             for value_info in inferred_model.graph.value_info
             if value_info.name == "loop_output"
         )
         first_dim = loop_output.type.tensor_type.shape.dim[0]
-        self.assertFalse(
-            first_dim.HasField("dim_value") and first_dim.dim_value == trip_count
-        )
+        self.assertFalse(first_dim.HasField("dim_value") and first_dim.dim_value == 5)
         self.assertEqual(loop_output.type.tensor_type.shape.dim[1].dim_value, 3)
 
     def test_constantofshape_with_input_shape(self) -> None:
