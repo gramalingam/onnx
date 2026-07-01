@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pytest
+from google.protobuf import text_format
 from parameterized import parameterized
 
 import onnx.shape_inference
@@ -6944,51 +6945,24 @@ class TestShapeInference(TestShapeInferenceHelper):
         )
 
     def test_loop(self) -> None:
-        # can't use self._make_graph for the subgraph as it add more inputs for the Reshape operations it inserts.
-        # this breaks the subgraph inferencing as it expects the number of inputs passed from Loop to match
-        # the GraphProto, but Loop knows nothing about the additional inputs.
-        input_value_infos = [
-            make_tensor_value_info("iter_num_in", TensorProto.INT64, (1,)),
-            make_tensor_value_info("cond_in", TensorProto.UNDEFINED, None),
-            make_tensor_value_info("loop_state_in", TensorProto.UNDEFINED, ()),
-        ]
-        output_value_infos = [
-            make_tensor_value_info("cond_out", TensorProto.UNDEFINED, None),
-            make_tensor_value_info("loop_state_out", TensorProto.UNDEFINED, None),
-            make_tensor_value_info("output", TensorProto.FLOAT, (3,)),
-        ]
-
-        subgraph = helper.make_graph(
-            [
-                make_node("Identity", ["cond_in"], ["cond_out"]),
-                make_node("Identity", ["loop_state_in"], ["loop_state_out"]),
-                make_node("Identity", ["outer_scope_input"], ["output"]),
-            ],
-            "subgraph",
-            input_value_infos,
-            output_value_infos,
+        model = onnx.parser.parse_model(
+            """
+            <ir_version: 8, opset_import: ["" : 13]>
+            test_loop (int64[1] max_trip_count, float[1] cond_orig, float[2] loop_state_orig, float[3] outer_scope_input) => (float final_state, float[?, 3] scan_result)
+            {
+                loop_state_final, loop_output = Loop <body = subgraph (int64[1] iter_num_in, ? cond_in, ? loop_state_in) => (? cond_out, ? loop_state_out, float[3] output)
+                {
+                    cond_out = Identity(cond_in)
+                    loop_state_out = Identity(loop_state_in)
+                    output = Identity(outer_scope_input)
+                }>(max_trip_count, cond_orig, loop_state_orig)
+                final_state = Identity(loop_state_final)
+                scan_result = Identity(loop_output)
+            }
+            """
         )
-
-        graph = self._make_graph(
-            [
-                ("max_trip_count", TensorProto.INT64, (1,)),
-                ("cond_orig", TensorProto.FLOAT, (1,)),
-                ("loop_state_orig", TensorProto.FLOAT, (2,)),
-                ("outer_scope_input", TensorProto.FLOAT, (3,)),
-            ],
-            [
-                make_node(
-                    "Loop",
-                    ["max_trip_count", "cond_orig", "loop_state_orig"],
-                    ["loop_state_final", "loop_output"],
-                    body=subgraph,
-                )
-            ],
-            [],
-        )
-
         self._assert_inferred(
-            graph,
+            model,
             [
                 make_tensor_value_info(
                     "loop_state_final", TensorProto.FLOAT, None
@@ -13235,15 +13209,58 @@ class TestShapeInference(TestShapeInferenceHelper):
         )
 
     def test_protobuf_default(self) -> None:
-        model = onnx.parser.parse_model(
-            """
-            <ir_version: 8, producer_name: "test", opset_import: ["" : 18]>
-            g (float[2, 3] in) => (float[1, 6] out) {
-                out = Flatten<axis = 0>(in)
+        model_text = """
+            ir_version: 8
+            producer_name: "test"
+            graph {
+              node {
+                input: "in"
+                output: "out"
+                op_type: "Flatten"
+                attribute {
+                  name: "axis"
+                  type: INT
+                }
+              }
+              name: "g"
+              input {
+                name: "in"
+                type {
+                  tensor_type {
+                    elem_type: 1
+                    shape {
+                      dim {
+                        dim_value: 2
+                      }
+                      dim {
+                        dim_value: 3
+                      }
+                    }
+                  }
+                }
+              }
+              output {
+                name: "out"
+                type {
+                  tensor_type {
+                    elem_type: 1
+                    shape {
+                      dim {
+                        dim_value: 1
+                      }
+                      dim {
+                        dim_value: 6
+                      }
+                    }
+                  }
+                }
+              }
             }
-            """
-        )
-        model.graph.node[0].attribute[0].ClearField("i")
+            opset_import {
+              version: 18
+            }
+        """
+        model = text_format.Parse(model_text, onnx.ModelProto())
         self._assert_inferred(model, [])
 
     def test_infer_shapes_rejects_cyclic_function(self):
