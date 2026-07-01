@@ -7039,6 +7039,62 @@ class TestShapeInference(TestShapeInferenceHelper):
             graph, [make_tensor_value_info("loop_output", TensorProto.FLOAT, (None, 3))]
         )
 
+    def test_loop_with_constant_trip_count_and_early_exit(self) -> None:
+        trip_count = 5
+        subgraph = helper.make_graph(
+            [
+                make_node(
+                    "Constant",
+                    [],
+                    ["cond_out"],
+                    value=make_tensor(
+                        "cond_out_value", TensorProto.BOOL, (), (False,)
+                    ),
+                ),
+                make_node("Identity", ["outer_scope_input"], ["output"]),
+            ],
+            "subgraph",
+            [
+                make_tensor_value_info("iter_num_in", TensorProto.INT64, ()),
+                make_tensor_value_info("cond_in", TensorProto.BOOL, ()),
+            ],
+            [
+                make_tensor_value_info("cond_out", TensorProto.BOOL, ()),
+                make_tensor_value_info("output", TensorProto.FLOAT, (3,)),
+            ],
+        )
+
+        graph = helper.make_graph(
+            [
+                make_node(
+                    "Loop",
+                    ["max_trip_count", "cond_orig"],
+                    ["loop_output"],
+                    body=subgraph,
+                )
+            ],
+            "test",
+            [],
+            [],
+            initializer=[
+                make_tensor("max_trip_count", TensorProto.INT64, (), (trip_count,)),
+                make_tensor("cond_orig", TensorProto.BOOL, (), (True,)),
+                make_tensor(
+                    "outer_scope_input", TensorProto.FLOAT, (3,), (1.0, 2.0, 3.0)
+                ),
+            ],
+        )
+
+        inferred_model = self._inferred(graph, data_prop=True)
+        loop_output = next(
+            value_info
+            for value_info in inferred_model.graph.value_info
+            if value_info.name == "loop_output"
+        )
+        first_dim = loop_output.type.tensor_type.shape.dim[0]
+        self.assertFalse(first_dim.HasField("dim_value") and first_dim.dim_value == trip_count)
+        self.assertEqual(loop_output.type.tensor_type.shape.dim[1].dim_value, 3)
+
     def test_constantofshape_with_input_shape(self) -> None:
         graph = self._make_graph(
             [],
