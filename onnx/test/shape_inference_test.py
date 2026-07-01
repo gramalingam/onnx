@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pytest
-from google.protobuf import text_format
 from parameterized import parameterized
 
 import onnx.shape_inference
@@ -13236,58 +13235,15 @@ class TestShapeInference(TestShapeInferenceHelper):
         )
 
     def test_protobuf_default(self) -> None:
-        model_text = """
-            ir_version: 8
-            producer_name: "test"
-            graph {
-              node {
-                input: "in"
-                output: "out"
-                op_type: "Flatten"
-                attribute {
-                  name: "axis"
-                  type: INT
-                }
-              }
-              name: "g"
-              input {
-                name: "in"
-                type {
-                  tensor_type {
-                    elem_type: 1
-                    shape {
-                      dim {
-                        dim_value: 2
-                      }
-                      dim {
-                        dim_value: 3
-                      }
-                    }
-                  }
-                }
-              }
-              output {
-                name: "out"
-                type {
-                  tensor_type {
-                    elem_type: 1
-                    shape {
-                      dim {
-                        dim_value: 1
-                      }
-                      dim {
-                        dim_value: 6
-                      }
-                    }
-                  }
-                }
-              }
+        model = onnx.parser.parse_model(
+            """
+            <ir_version: 8, producer_name: "test", opset_import: ["" : 18]>
+            g (float[2, 3] in) => (float[1, 6] out) {
+                out = Flatten<axis = 0>(in)
             }
-            opset_import {
-              version: 18
-            }
-        """
-        model = text_format.Parse(model_text, onnx.ModelProto())
+            """
+        )
+        model.graph.node[0].attribute[0].ClearField("i")
         self._assert_inferred(model, [])
 
     def test_infer_shapes_rejects_cyclic_function(self):
