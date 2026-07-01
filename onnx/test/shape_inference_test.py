@@ -7047,9 +7047,7 @@ class TestShapeInference(TestShapeInferenceHelper):
                     "Constant",
                     [],
                     ["cond_out"],
-                    value=make_tensor(
-                        "cond_out_value", TensorProto.BOOL, (), (False,)
-                    ),
+                    value=make_tensor("cond_out_value", TensorProto.BOOL, (), (False,)),
                 ),
                 make_node("Identity", ["outer_scope_input"], ["output"]),
             ],
@@ -7092,7 +7090,9 @@ class TestShapeInference(TestShapeInferenceHelper):
             if value_info.name == "loop_output"
         )
         first_dim = loop_output.type.tensor_type.shape.dim[0]
-        self.assertFalse(first_dim.HasField("dim_value") and first_dim.dim_value == trip_count)
+        self.assertFalse(
+            first_dim.HasField("dim_value") and first_dim.dim_value == trip_count
+        )
         self.assertEqual(loop_output.type.tensor_type.shape.dim[1].dim_value, 3)
 
     def test_constantofshape_with_input_shape(self) -> None:
