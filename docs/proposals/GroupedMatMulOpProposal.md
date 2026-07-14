@@ -16,7 +16,9 @@ SPDX-License-Identifier: MIT
 
 1. [Motivation](#1-motivation)
 2. [Prior Art and Framework Support](#2-prior-art-and-framework-support)
-3. [Why Not a Function?](#3-why-not-a-function)
+3. [Semantics (Function Decomposition)](#3-semantics-function-decomposition)
+   - 3.1 [Function Decomposition](#31-function-decomposition)
+   - 3.2 [Edge Cases](#32-edge-cases)
 4. [Operator Specification](#4-operator-specification)
    - 4.1 [Name and Domain](#41-name-and-domain)
    - 4.2 [Inputs](#42-inputs)
@@ -24,15 +26,11 @@ SPDX-License-Identifier: MIT
    - 4.4 [Type Constraints](#44-type-constraints)
    - 4.5 [Attributes](#45-attributes)
    - 4.6 [Shape Inference Rules](#46-shape-inference-rules)
-5. [Semantics](#5-semantics)
-   - 5.1 [Pseudocode](#51-pseudocode)
-   - 5.2 [Edge Cases](#52-edge-cases)
-6. [Reference Implementation (Python)](#6-reference-implementation-python)
-7. [Test Cases](#7-test-cases)
-8. [Typical Usage — MoE Feed-Forward Layer](#8-typical-usage--moe-feed-forward-layer)
-9. [Design Alternatives Considered](#9-design-alternatives-considered)
-10. [Relationship to Existing ONNX Operators](#10-relationship-to-existing-onnx-operators)
-11. [Files Required for onnx/onnx PR](#11-files-required-for-onnxonnx-pr)
+5. [Test Cases](#5-test-cases)
+6. [Typical Usage — MoE Feed-Forward Layer](#6-typical-usage--moe-feed-forward-layer)
+7. [Design Alternatives Considered](#7-design-alternatives-considered)
+8. [Relationship to Existing ONNX Operators](#8-relationship-to-existing-onnx-operators)
+9. [Files Required for onnx/onnx PR](#9-files-required-for-onnxonnx-pr)
 
 ---
 
@@ -68,25 +66,76 @@ The PyTorch `torch.nn.functional.grouped_mm` API (added in 2.5) directly matches
 ```python
 # PyTorch grouped_mm — same semantics
 out = torch.nn.functional.grouped_mm(input, weight, offs=None)
-# offs are contiguous group offsets; our design uses indices instead (see §9.3)
+# offs are contiguous group offsets; our design uses indices instead (see §7.3)
 ```
 
 ---
 
-## 3. Function Decomposition
+## 3. Semantics (Function Decomposition)
 
-The reference decomposition is:
+This section is the **single, normative definition** of `GroupedMatMul`. The operator is
+specified as an ONNX **function**: its meaning is exactly the composition of standard ONNX
+operators given below. Because the presence of the optional `combine_weights` and `bias`
+inputs changes the graph that is produced, the function body is **context-dependent** (built
+via `SetContextDependentFunctionBodyBuilder`, in the style of existing ops such as
+`CenterCropPad`).
+
+Defining the semantics as a function has a useful consequence for onnx/onnx: the reference
+evaluator (`onnx.reference.ReferenceEvaluator`) automatically executes an operator through
+its function body when no dedicated Python kernel is registered, so **no separate reference
+implementation file is required**. A single decomposition therefore serves as specification,
+documentation, and reference implementation.
+
+Input and output names, shapes, and type constraints are defined in [§4](#4-operator-specification).
+The symbols used below are `M`, `K`, `N`, `G` (= `weights.shape[0]`) and `k` (=
+`group_indices.shape[1]`).
+
+> **Note on efficiency.** The decomposition materialises a full `[M*k, K, N]` weight slice
+> and an `[M*k, K]` copy of the tokens. As explained in [§1](#1-motivation), these
+> intermediates are gigabytes in size for real MoE layers, which is precisely why
+> `GroupedMatMul` exists as a fused operator: it defines *what* is computed, while runtimes
+> are expected to fuse the computation rather than execute the naive decomposition. The
+> decomposition is normative for the *result*, not for the *strategy*.
+
+### 3.1 Function Decomposition
 
 ```
-# Per-expert results r: [M, k, N]
+# Common part — per-expert results r: [M, k, N]
 idx_flat  = Reshape(group_indices, [M*k])
 W_sel     = Gather(weights, idx_flat, axis=0)            # [M*k, K, N] — duplicates weights!
-X         = Reshape(Expand(Unsqueeze(input,1),[M,k,K]),  # [M*k, 1, K] — copies tokens!
-                    [M*k, 1, K])
-r         = Reshape(MatMul(X, W_sel), [M, k, N])
-# combine present:
-output    = ReduceSum(r * Unsqueeze(combine_weights,-1), axis=1)   # [M, N]
+X         = Reshape(Expand(Unsqueeze(input, 1), [M, k, K]),
+                    [M*k, 1, K])                         # [M*k, 1, K] — copies tokens!
+r         = Reshape(MatMul(X, W_sel), [M, k, N])         # [M, k, N]
+
+# If `bias` is present, add the per-group bias to each selected expert result:
+bias_sel  = Reshape(Gather(bias, idx_flat, axis=0), [M, k, N])   # [M, k, N]
+r         = r + bias_sel                                          # (only when bias present)
+
+# If `combine_weights` is present -> weighted sum over the k slots, output [M, N]:
+output    = ReduceSum(r * Unsqueeze(combine_weights, -1), axis=1, keepdims=0)   # [M, N]
+
+# Otherwise (combine_weights absent) -> per-expert results, output [M, k, N]:
+output    = r                                                                    # [M, k, N]
 ```
+
+The four resulting cases (with/without `bias` × with/without `combine_weights`) are what the
+context-dependent function body emits: the `bias` line is included only when input 4 is
+present, and exactly one of the two `output` assignments is emitted depending on whether
+input 3 (`combine_weights`) is present.
+
+### 3.2 Edge Cases
+
+The decomposition already gives well-defined behaviour for every special case below; the
+table records the resulting behaviour for clarity.
+
+| Case | Behaviour |
+|---|---|
+| Empty group (`g` receives no selections) | `weights[g]` is simply never gathered; valid. |
+| `k == 1` without combine | Dense grouped matmul: one expert per token, output `[M, 1, N]`. |
+| `k == 1` with combine | Effectively scales each token result by `combine_weights[i, 0]`. |
+| `G == 1`, all indices 0 | Equivalent to `MatMul(input, weights[0])` (+ optional bias). |
+| `M == 0` | Zero-token input; output shape is `[0, N]` or `[0, k, N]`; no compute required. |
+| Out-of-range index | Follows `Gather` semantics for out-of-range indices, which are implementation-defined (implementations must not silently produce garbage; they should raise an error). |
 
 ---
 
@@ -161,122 +210,7 @@ output.shape = [M, N]       if combine_weights is present
 
 ---
 
-## 5. Semantics
-
-### 5.1 Pseudocode
-
-```python
-# Inputs:
-#   input:           [M, K]
-#   weights:         [G, K, N]
-#   group_indices:   [M, k]           integers in [0, G)
-#   combine_weights: [M, k] or None
-#   bias:            [G, N]  or None
-#
-# r[i, j] = input[i] @ weights[group_indices[i, j]]  (+ bias if present)
-
-r = np.zeros((M, k, N), dtype=input.dtype)
-
-for i in range(M):
-    for j in range(k):
-        g = group_indices[i, j]
-        assert 0 <= g < G, "group index out of range"
-        r[i, j] = input[i] @ weights[g]    # [K] @ [K, N] -> [N]
-        if bias is not None:
-            r[i, j] += bias[g]
-
-if combine_weights is not None:
-    # Weighted sum over the k expert slots -> [M, N]
-    output = np.einsum('ijk,ij->ik', r, combine_weights)
-else:
-    # Return per-expert results -> [M, k, N]
-    output = r
-```
-
-### 5.2 Edge Cases
-
-| Case | Behaviour |
-|---|---|
-| Empty group (`g` receives no selections) | `weights[g]` is unused; valid. |
-| `k == 1` without combine | Dense grouped matmul: one expert per token, output `[M, 1, N]`. |
-| `k == 1` with combine | Effectively scales each token result by `combine_weights[i, 0]`. |
-| `G == 1`, all indices 0 | Equivalent to `MatMul(input, weights[0])` (+ optional bias). |
-| `M == 0` | Zero-token input; output shape is `[0, N]` or `[0, k, N]`; no compute required. |
-| Out-of-range index | Implementation-defined error (must not silently produce garbage). Implementors should raise an error or produce undefined results only for out-of-range indices. |
-
----
-
-## 6. Reference Implementation (Python)
-
-This implementation is intended to be placed at
-`onnx/reference/ops/op_grouped_matmul.py` in the onnx/onnx repository.
-
-```python
-# SPDX-License-Identifier: Apache-2.0
-"""Reference implementation for the GroupedMatMul operator."""
-
-import numpy as np
-from onnx.reference.op_run import OpRun
-
-
-class GroupedMatMul(OpRun):
-    """
-    GroupedMatMul(input, weights, group_indices[, combine_weights[, bias]])
-
-    Computes a grouped (expert) matrix multiplication as used in
-    Mixture-of-Experts feed-forward layers.
-
-    For each token i and expert slot j:
-        r[i, j] = input[i] @ weights[group_indices[i, j]]
-                  (+ bias[group_indices[i, j]] if bias is provided)
-
-    If combine_weights is provided:
-        output[i] = sum_j combine_weights[i, j] * r[i, j]    shape [M, N]
-    Otherwise:
-        output = r                                             shape [M, k, N]
-    """
-
-    op_domain = "ai.onnx"
-
-    def _run(self, input, weights, group_indices, combine_weights=None, bias=None):
-        M, K = input.shape
-        G, wK, N = weights.shape
-        assert wK == K, f"weights dim 1 ({wK}) must equal input dim 1 ({K})"
-        assert group_indices.shape == (M, int(group_indices.shape[1])), \
-            "group_indices must have shape (M, k)"
-        k = group_indices.shape[1]
-
-        # Promote to float64 for numerical stability in the reference.
-        dtype = input.dtype
-        inp = input.astype(np.float64)
-        wts = weights.astype(np.float64)
-
-        # Compute per-expert results: r[i, j] = inp[i] @ wts[g] (+ bias)
-        r = np.zeros((M, k, N), dtype=np.float64)
-        for i in range(M):
-            for j in range(k):
-                g = int(group_indices[i, j])
-                if g < 0 or g >= G:
-                    raise ValueError(
-                        f"group_indices[{i},{j}] = {g} is out of range [0, {G})"
-                    )
-                r[i, j] = inp[i] @ wts[g]
-                if bias is not None:
-                    r[i, j] += bias[g].astype(np.float64)
-
-        if combine_weights is not None:
-            # Weighted sum: output[i] = sum_j combine_weights[i, j] * r[i, j]
-            cw = combine_weights.astype(np.float64)   # [M, k]
-            output = np.einsum("ijk,ij->ik", r, cw)   # [M, N]
-        else:
-            output = r  # [M, k, N]
-
-        return (output.astype(dtype),)
-```
-
----
-
-## 7. Test Cases
+## 5. Test Cases
 
 These cases are intended for `onnx/backend/test/case/node/groupedmatmul.py`.
 
@@ -350,7 +284,7 @@ group_indices = [[0], [0], [0]]        # all tokens -> group 0
 
 ---
 
-## 8. Typical Usage — MoE Feed-Forward Layer
+## 6. Typical Usage — MoE Feed-Forward Layer
 
 A standard top-k MoE FFN with two projections maps directly onto two `GroupedMatMul` ops.
 No `Expand` of the token batch is required — the op reuses each token row across its `k`
@@ -390,9 +324,9 @@ intermediate through memory.
 
 ---
 
-## 9. Design Alternatives Considered
+## 7. Design Alternatives Considered
 
-### 9.1 Single `[M, k]` index tensor vs. separate 2-D/3-D variants
+### 7.1 Single `[M, k]` index tensor vs. separate 2-D/3-D variants
 
 The current proposal uses a single `[M, k]` `group_indices` tensor, with `k=1` as the dense
 case. An alternative would be separate op signatures for the dense and top-k cases.
@@ -401,7 +335,7 @@ case. An alternative would be separate op signatures for the dense and top-k cas
 Callers flatten any leading batch dimensions into `M` first; in ONNX Runtime a `Reshape` of
 this kind is a zero-copy metadata-only operation.
 
-### 9.2 Fused activation
+### 7.2 Fused activation
 
 An earlier draft included an optional `activation` attribute (`"none"`, `"silu"`, `"relu"`).
 
@@ -409,7 +343,7 @@ An earlier draft included an optional `activation` attribute (`"none"`, `"silu"`
 composable across the many MoE routing variants. The combine step is fused because it is
 common to all variants and cannot otherwise avoid the `Expand`/`ReduceSum` memory overhead.
 
-### 9.3 `group_indices` vs. `group_offsets`
+### 7.3 `group_indices` vs. `group_offsets`
 
 An alternative interface uses a sorted token buffer and integer offsets instead of unsorted
 indices. This matches the cuBLAS grouped-GEMM API more directly.
@@ -419,7 +353,7 @@ and do not require callers to pre-sort the token batch. Runtimes sort internally
 CPU and CUDA implementations do so). This keeps the op declarative, matching ONNX's role as
 a model interchange format rather than a kernel description language.
 
-### 9.4 Stacked 3-D weights `[G, K, N]` vs. a list of variable-size matrices
+### 7.4 Stacked 3-D weights `[G, K, N]` vs. a list of variable-size matrices
 
 An alternative would be a sequence of weight tensors with potentially different `K`/`N`
 dimensions per expert (the general "heterogeneous-expert" case).
@@ -428,7 +362,7 @@ dimensions per expert (the general "heterogeneous-expert" case).
 common case in deployed MoE models. Homogeneous shapes keep memory contiguous, enable
 static shape inference, and simplify every implementation.
 
-### 9.5 Batched leading dimensions in `input`
+### 7.5 Batched leading dimensions in `input`
 
 An alternative would accept `input` of shape `[..., K]` with an arbitrary leading batch.
 
@@ -438,18 +372,18 @@ to a single flat-indexing code path without losing any expressiveness.
 
 ---
 
-## 10. Relationship to Existing ONNX Operators
+## 8. Relationship to Existing ONNX Operators
 
 | Existing op | Relationship |
 |---|---|
 | `MatMul` | `GroupedMatMul` with `G=1`, all indices 0, no combine is identical to `MatMul(input, weights[0])`. |
-| `GatherND` + `MatMul` | The reference decomposition (see §3) uses these; `GroupedMatMul` is a fused efficient version. |
+| `GatherND` + `MatMul` | The function decomposition (see §3) uses these; `GroupedMatMul` is a fused efficient version. |
 | `Einsum` | Cannot express the dynamic routing (index-dependent contraction) without materialising the gathered weight slice. |
 | `QLinearMatMul` | Quantised MatMul; a future `QLinearGroupedMatMul` could follow the same design. |
 
 ---
 
-## 11. Files Required for onnx/onnx PR
+## 9. Files Required for onnx/onnx PR
 
 The following files must be added or modified in the `onnx/onnx` repository to complete the
 standardisation, as described in
@@ -459,12 +393,16 @@ standardisation, as described in
 |---|---|
 | Schema definition (C++) | `onnx/defs/math/defs.cc` — add `ONNX_OPERATOR_SET_SCHEMA(GroupedMatMul, <opset>, ...)` |
 | Operator set registration | `onnx/defs/operator_sets.h` — add entry in current opset block |
+| Function body (semantics) | Context-dependent function body attached to the schema via `.SetContextDependentFunctionBodyBuilder(...)`, implementing the decomposition in §3 |
 | Type/shape inference | Inline in schema via `.TypeAndShapeInferenceFunction(...)` (see §4.6) |
-| Python reference implementation | `onnx/reference/ops/op_grouped_matmul.py` (see §6) |
-| Node tests | `onnx/backend/test/case/node/groupedmatmul.py` (see §7) |
+| Node tests | `onnx/backend/test/case/node/groupedmatmul.py` (see §5) |
 | Shape inference tests | `onnx/test/shape_inference_test.py` |
 | Upgrade tests | `onnx/test/version_converter/automatic_upgrade_test.py` |
 | Downgrade tests | `onnx/test/version_converter/automatic_downgrade_test.py` |
+
+No dedicated Python reference implementation (`onnx/reference/ops/op_grouped_matmul.py`) is
+needed: because the operator carries a function body, `onnx.reference.ReferenceEvaluator`
+executes it by expanding that body (see §3), so the decomposition is also the reference.
 
 The reference ONNX Runtime implementation (`com.microsoft.GroupedMatMul`) provides CPU and
 CUDA kernels that can guide implementors:
