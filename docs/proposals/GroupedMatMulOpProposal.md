@@ -29,8 +29,6 @@ SPDX-License-Identifier: MIT
 5. [Test Cases](#5-test-cases)
 6. [Typical Usage — MoE Feed-Forward Layer](#6-typical-usage--moe-feed-forward-layer)
 7. [Design Alternatives Considered](#7-design-alternatives-considered)
-8. [Relationship to Existing ONNX Operators](#8-relationship-to-existing-onnx-operators)
-9. [Files Required for onnx/onnx PR](#9-files-required-for-onnxonnx-pr)
 
 ---
 
@@ -130,12 +128,13 @@ table records the resulting behaviour for clarity.
 
 | Case | Behaviour |
 |---|---|
-| Empty group (`g` receives no selections) | `weights[g]` is simply never gathered; valid. |
-| `k == 1` without combine | Dense grouped matmul: one expert per token, output `[M, 1, N]`. |
+| `k == 0` without combine | No expert selected, empty tensor output of shape `[M, 0, N]`. (Not expected in real model.) |
+| `k == 0` with combine | No expert selected, output is all zeros of shape `[M, N]`. (Not expected in real model.) |
+| `k == 1` without combine | One expert per token, output of shape `[M, 1, N]`. |
 | `k == 1` with combine | Effectively scales each token result by `combine_weights[i, 0]`. |
 | `G == 1`, all indices 0 | Equivalent to `MatMul(input, weights[0])` (+ optional bias). |
 | `M == 0` | Zero-token input; output shape is `[0, N]` or `[0, k, N]`; no compute required. |
-| Out-of-range index | Follows `Gather` semantics for out-of-range indices, which are implementation-defined (implementations must not silently produce garbage; they should raise an error). |
+| Out-of-range index | Invalid input (implementations must raise an error). |
 
 ---
 
@@ -163,7 +162,7 @@ table records the resulting behaviour for clarity.
 **Notes:**
 
 * `G = weights.shape[0]` (number of groups / experts).
-* Callers with batched inputs of shape `[B, M, K]` should `Reshape` the batch dimensions into `M` first. In ONNX Runtime this is a zero-copy metadata-only view.
+* Callers with batched inputs of shape `[B, M, K]` should `Reshape` the batch dimensions into `M` first. In most backends, typically this is a zero-copy metadata-only view construction.
 * `weights` and `bias` are the same for all tokens (i.e., they are model parameters, not per-token).
 
 ### 4.3 Outputs
@@ -326,22 +325,32 @@ intermediate through memory.
 
 ## 7. Design Alternatives Considered
 
-### 7.1 Single `[M, k]` index tensor vs. separate 2-D/3-D variants
+### 7.1 Special-case shapes for `k==1`
 
-The current proposal uses a single `[M, k]` `group_indices` tensor, with `k=1` as the dense
-case. An alternative would be separate op signatures for the dense and top-k cases.
+The current proposal requires `group_indices` to be a 2-dimensional tensor of shape `[M, k]`.
+An alternative would be to allow a 1-dimensional tensor of shape `[M]` for the `k=1` special case.
 
-**Decision: single `[M, k]` form.** This keeps the spec and every kernel to one code path.
-Callers flatten any leading batch dimensions into `M` first; in ONNX Runtime a `Reshape` of
-this kind is a zero-copy metadata-only operation.
+### 7.2 Explicit batch dimension
+The `M` tokens are flattened into a single dimension in this op. In actual usage, when
+batching is used, we might have multi-dimensional tokens, eg, `[Batch, Sequence]`.
+We could potentially support an extra batch dimension to avoid extra Reshapes.
+We could even let M be any number of dimensions, but that leads to extra complexity that doesn't
+seem useful.
 
-### 7.2 Fused activation
+### 7.3 Larger Fused Ops
 
-An earlier draft included an optional `activation` attribute (`"none"`, `"silu"`, `"relu"`).
+In practice, implementations may use even more aggressive fusions in the implementation
+of a MoE feed-forward layer: for example, fusing the down-projection, activation, up-projection, etc.
+For example, onnxruntime's contrib op for MoE does this.
+
+The disadvantage is that the activation used varies across models, with new models exploring
+use of newer activations all the time. Thus, onnxruntime's contrib op faces a need to
+be continuously updated to support newer activations. There is no good solution for this
+currently.
 
 **Decision: no fused activation.** Activations stay as separate ONNX ops to keep the graph
-composable across the many MoE routing variants. The combine step is fused because it is
-common to all variants and cannot otherwise avoid the `Expand`/`ReduceSum` memory overhead.
+composable across the many MoE routing variants. The combine step is (optionally) fused
+because it is common to all variants and helps avoid the `Expand`/`ReduceSum` memory overhead.
 
 ### 7.3 `group_indices` vs. `group_offsets`
 
@@ -349,9 +358,7 @@ An alternative interface uses a sorted token buffer and integer offsets instead 
 indices. This matches the cuBLAS grouped-GEMM API more directly.
 
 **Decision: `group_indices` (unsorted).** Indices compose naturally with `TopK`/`Gather`
-and do not require callers to pre-sort the token batch. Runtimes sort internally (both the
-CPU and CUDA implementations do so). This keeps the op declarative, matching ONNX's role as
-a model interchange format rather than a kernel description language.
+and do not require callers to pre-sort the token batch. Runtimes sort internally.
 
 ### 7.4 Stacked 3-D weights `[G, K, N]` vs. a list of variable-size matrices
 
@@ -359,58 +366,9 @@ An alternative would be a sequence of weight tensors with potentially different 
 dimensions per expert (the general "heterogeneous-expert" case).
 
 **Decision: stacked `[G, K, N]`.** All experts sharing `K` and `N` is the overwhelmingly
-common case in deployed MoE models. Homogeneous shapes keep memory contiguous, enable
-static shape inference, and simplify every implementation.
+common case in deployed MoE models. A single weight tensor is simpler. (Implementations,
+however, may benefit by treating the different experts slices within the single tensor
+differently, for example to handle cases where the entire tensor is too large to fit
+into memory at same time).
 
-### 7.5 Batched leading dimensions in `input`
 
-An alternative would accept `input` of shape `[..., K]` with an arbitrary leading batch.
-
-**Decision: require `input` to be 2-D `[M, K]`.** Callers flatten leading dims via
-`Reshape`, which is zero-copy in ONNX Runtime. This keeps the spec and every implementation
-to a single flat-indexing code path without losing any expressiveness.
-
----
-
-## 8. Relationship to Existing ONNX Operators
-
-| Existing op | Relationship |
-|---|---|
-| `MatMul` | `GroupedMatMul` with `G=1`, all indices 0, no combine is identical to `MatMul(input, weights[0])`. |
-| `GatherND` + `MatMul` | The function decomposition (see §3) uses these; `GroupedMatMul` is a fused efficient version. |
-| `Einsum` | Cannot express the dynamic routing (index-dependent contraction) without materialising the gathered weight slice. |
-| `QLinearMatMul` | Quantised MatMul; a future `QLinearGroupedMatMul` could follow the same design. |
-
----
-
-## 9. Files Required for onnx/onnx PR
-
-The following files must be added or modified in the `onnx/onnx` repository to complete the
-standardisation, as described in
-[`docs/AddNewOp.md`](https://github.com/onnx/onnx/blob/main/docs/AddNewOp.md):
-
-| Component | File |
-|---|---|
-| Schema definition (C++) | `onnx/defs/math/defs.cc` — add `ONNX_OPERATOR_SET_SCHEMA(GroupedMatMul, <opset>, ...)` |
-| Operator set registration | `onnx/defs/operator_sets.h` — add entry in current opset block |
-| Function body (semantics) | Context-dependent function body attached to the schema via `.SetContextDependentFunctionBodyBuilder(...)`, implementing the decomposition in §3 |
-| Type/shape inference | Inline in schema via `.TypeAndShapeInferenceFunction(...)` (see §4.6) |
-| Node tests | `onnx/backend/test/case/node/groupedmatmul.py` (see §5) |
-| Shape inference tests | `onnx/test/shape_inference_test.py` |
-| Upgrade tests | `onnx/test/version_converter/automatic_upgrade_test.py` |
-| Downgrade tests | `onnx/test/version_converter/automatic_downgrade_test.py` |
-
-No dedicated Python reference implementation (`onnx/reference/ops/op_grouped_matmul.py`) is
-needed: because the operator carries a function body, `onnx.reference.ReferenceEvaluator`
-executes it by expanding that body (see §3), so the decomposition is also the reference.
-
-The reference ONNX Runtime implementation (`com.microsoft.GroupedMatMul`) provides CPU and
-CUDA kernels that can guide implementors:
-
-| File | Description |
-|---|---|
-| `onnxruntime/contrib_ops/cpu/grouped_matmul.cc` | CPU kernel (gather + MLAS GEMM per group + scatter/combine) |
-| `onnxruntime/contrib_ops/cuda/grouped_matmul.cc` | CUDA kernel (sorted gather + cuBLAS GEMM per group + scatter/combine) |
-| `onnxruntime/contrib_ops/cuda/grouped_matmul_impl.cu` | CUDA gather/scatter/combine device kernels |
-| `onnxruntime/test/contrib_ops/grouped_matmul_test.cc` | Tests covering dense, top-k, combine, bias, empty-group, and float16 paths |
-| `docs/GroupedMatMul.md` | Full design specification with MoE usage diagram |
