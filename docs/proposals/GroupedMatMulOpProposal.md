@@ -42,13 +42,13 @@ Mixture-of-Experts (MoE) feed-forward layers are a central component of large la
 
 > Given a batch of `M` token vectors and a set of `num_groups` expert weight matrices, multiply each token by one or more expert matrices chosen per-token by a router. Optionally, combine the `k` per-expert results with learned combine weights.
 
-This pattern — often called **grouped matrix multiplication** or **grouped GEMM** — cannot be expressed efficiently using existing standard ONNX operators:
+This pattern — often called **grouped matrix multiplication** or **grouped GEMM** — can be expressed using existing standard ONNX operators, but a straightforward (unfused) implementation will be very inefficient and impractical.
 
 * The natural decomposition (`Gather` weights → `Expand` tokens → batched `MatMul`) materialises a full `[M×k, K, N]` weight slice and an `[M×k, K]` copy of tokens. For real MoE layers these tensors are gigabytes in size, making the decomposition impractical.
-* A fused grouped-GEMM kernel processes each expert weight matrix once regardless of the number of tokens that select it, and reuses each token row across its `k` experts without copying. It can additionally fuse the `k`-way weighted sum (the "combine" step), avoiding a materialised `[M, k, N]` intermediate.
-* Without a standard op, every runtime must implement its own custom operator (ONNX Runtime `com.microsoft.GroupedMatMul`, PyTorch `torch.ops.higher_order.flex_attention`, etc.), making MoE models non-portable across ONNX-consuming runtimes.
+* A fused grouped-GEMM kernel, on the other hand, processes each expert weight matrix once regardless of the number of tokens that select it, and reuses each token row across its `k` experts without copying. It can additionally fuse the `k`-way weighted sum (the "combine" step), avoiding a materialised `[M, k, N]` intermediate.
 
-Adding `GroupedMatMul` to the ONNX standard closes this portability gap.
+
+Adding `GroupedMatMul` to the ONNX standard will enable a more compact and efficient representation of MoE models.
 
 ---
 
@@ -61,7 +61,6 @@ Adding `GroupedMatMul` to the ONNX standard closes this portability gap.
 | JAX | `jax.lax.dot_general` with grouped batching |
 | cuBLAS | `cublasGemmBatchedEx` / `cublasGemmGroupedBatchedEx` |
 | CUTLASS | `GroupedGemm` kernel |
-| ONNX Runtime | `com.microsoft.GroupedMatMul` (this implementation) |
 | OpenVINO | `GroupConvolution` (analogous for convolution) |
 
 The PyTorch `torch.nn.functional.grouped_mm` API (added in 2.5) directly matches the semantics proposed here:
@@ -72,16 +71,11 @@ out = torch.nn.functional.grouped_mm(input, weight, offs=None)
 # offs are contiguous group offsets; our design uses indices instead (see §9.3)
 ```
 
-MoE models that already export to ONNX using `com.microsoft.GroupedMatMul` include
-DeepSeek-V2/V3 (via Hugging Face optimum), Mixtral-8x7B export pipelines, and several
-internal Microsoft research models.
-
 ---
 
-## 3. Why Not a Function?
+## 3. Function Decomposition
 
-The ONNX `AddNewOp.md` guidelines ask whether an operator can be expressed as a function over
-existing ONNX primitives. The reference decomposition is:
+The reference decomposition is:
 
 ```
 # Per-expert results r: [M, k, N]
@@ -93,16 +87,6 @@ r         = Reshape(MatMul(X, W_sel), [M, k, N])
 # combine present:
 output    = ReduceSum(r * Unsqueeze(combine_weights,-1), axis=1)   # [M, N]
 ```
-
-This decomposition is **functionally correct but practically infeasible** for real MoE layers:
-
-1. `Gather(weights, idx_flat)` materialises `M*k` copies of weight rows — for M=4096 tokens, k=2
-   experts, K=4096, N=14336 (Mixtral dimensions), this is 4096 × 2 × 4096 × 14336 × 2 bytes ≈ **3.7 TB** of intermediate data per forward pass.
-2. `Expand` of `input` is a real data copy in current ONNX runtimes (not a lazy view).
-3. Even if future runtimes handled these lazily, the composed graph has no way to express the
-   "sort by group, one GEMM per group, scatter back" execution strategy that is 10–100× faster.
-
-Therefore `GroupedMatMul` must be a **primitive operator**, not a function.
 
 ---
 
