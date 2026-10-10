@@ -1661,6 +1661,77 @@ OpName_Domain_Version_Schema_Map& OpSchemaRegistry::GetMapWithoutEnsuringRegistr
   return map;
 }
 
+std::shared_mutex& OpSchemaRegistry::Mutex() {
+  static std::shared_mutex mutex;
+  return mutex;
+}
+
+std::recursive_mutex& OpSchemaRegistry::RegistrationMutex() {
+  static std::recursive_mutex mutex;
+  return mutex;
+}
+
+void OpSchemaRegistry::DomainToVersionRange::RetainDomainToVersion(
+    const std::string& domain,
+    int min_version,
+    int max_version,
+    int last_release_version) {
+  if (last_release_version == -1) {
+    last_release_version = max_version;
+  }
+  if (min_version > max_version) {
+    fail_schema("Invalid retained domain version range for domain: ", domain);
+  }
+  std::unique_lock<std::shared_mutex> registry_lock(Mutex());
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = map_.find(domain);
+  if (it == map_.end()) {
+    map_[domain] = {min_version, max_version};
+    last_release_version_map_[domain] = last_release_version;
+  } else {
+    it->second.first = std::min(it->second.first, min_version);
+    it->second.second = std::max(it->second.second, max_version);
+    auto& release = last_release_version_map_.at(domain);
+    release = std::max(release, last_release_version);
+  }
+  retained_domains_.insert(domain);
+}
+
+void OpSchemaRegistry::RestoreDomainToVersionIfUnused(
+    const std::string& domain,
+    bool had_original_range,
+    int min_version,
+    int max_version,
+    int last_release_version) {
+  if (had_original_range && min_version > max_version) {
+    fail_schema("Invalid original domain version range for domain: ", domain);
+  }
+  // Do not trigger lazy static registration while cleaning up a custom domain.
+  std::unique_lock<std::shared_mutex> registry_lock(Mutex());
+  const auto& schemas = GetMapWithoutEnsuringRegistration();
+  auto& ranges = DomainToVersionRange::Instance();
+  std::lock_guard<std::mutex> lock(ranges.mutex_);
+  if (ranges.retained_domains_.count(domain) != 0) {
+    return;
+  }
+  for (const auto& [name, domains] : schemas) {
+    const auto it = domains.find(domain);
+    if (it != domains.end() && !it->second.empty()) {
+      return;
+    }
+  }
+  if (ranges.map_.count(domain) == 0) {
+    fail_schema("Trying to restore an unknown domain: ", domain);
+  }
+  if (had_original_range) {
+    ranges.map_.at(domain) = {min_version, max_version};
+    ranges.last_release_version_map_.at(domain) = last_release_version;
+  } else {
+    ranges.map_.erase(domain);
+    ranges.last_release_version_map_.erase(domain);
+  }
+}
+
 OpName_Domain_Version_Schema_Map& OpSchemaRegistry::map() {
   auto& map = GetMapWithoutEnsuringRegistration();
 
@@ -1669,6 +1740,7 @@ OpName_Domain_Version_Schema_Map& OpSchemaRegistry::map() {
   class SchemasRegisterer {
    public:
     SchemasRegisterer() {
+      std::lock_guard<std::recursive_mutex> registration_lock(RegistrationMutex());
       // In debug builds, the number of schema registered in this constructor
       // is compared against the number of calls to schema registration macros.
 #ifndef NDEBUG
@@ -1704,6 +1776,7 @@ OpName_Domain_Version_Schema_Map& OpSchemaRegistry::map() {
    private:
 #ifndef NDEBUG
     static size_t GetRegisteredSchemaCount() {
+      std::shared_lock<std::shared_mutex> lock(Mutex());
       size_t count = 0;
       for (auto& x : GetMapWithoutEnsuringRegistration()) {
         for (auto& y : x.second) {

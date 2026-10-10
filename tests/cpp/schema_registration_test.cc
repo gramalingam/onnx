@@ -2,11 +2,33 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <atomic>
+#include <thread>
+#include <vector>
+
 #include "gtest/gtest.h"
 #include "onnx/defs/operator_sets.h"
 #include "onnx/defs/schema.h"
 
 namespace ONNX_NAMESPACE::Test {
+
+namespace {
+
+std::string LifecycleDomain() {
+  static std::atomic<int> next_id{0};
+  return "test.schema.lifecycle." + std::to_string(next_id++);
+}
+
+void RegisterLifecycleSchema(const std::string& domain, int version = 1) {
+  RegisterSchema(OpSchema().SetName("LifecycleOp").SetDomain(domain).SinceVersion(version), 0, true, true);
+}
+
+void RemoveLifecycleDomain(const std::string& domain) {
+  OpSchemaRegistry::OpSchemaDeregisterAll(domain);
+  OpSchemaRegistry::RestoreDomainToVersionIfUnused(domain, false, 0, 0, 0);
+}
+
+} // namespace
 
 TEST(SchemaRegistrationTest, DisabledOnnxStaticRegistrationAPICall) {
 #ifdef __ONNX_DISABLE_STATIC_REGISTRATION
@@ -14,6 +36,188 @@ TEST(SchemaRegistrationTest, DisabledOnnxStaticRegistrationAPICall) {
 #else
   EXPECT_FALSE(IsOnnxStaticRegistrationDisabled());
 #endif
+}
+
+// Run this test on its own in a fresh process to exercise lazy initialization.
+TEST(SchemaRegistrationTest, ConcurrentInitialLookupAndRegistration) {
+  auto& ranges = OpSchemaRegistry::DomainToVersionRange::Instance();
+  const auto domain = LifecycleDomain();
+  ranges.AddDomainToVersion(domain, 1, 100);
+  std::atomic<bool> start{false};
+  std::vector<std::thread> threads;
+  threads.emplace_back([&]() {
+    while (!start.load()) {
+      std::this_thread::yield();
+    }
+    for (int version = 1; version <= 100; ++version) {
+      RegisterLifecycleSchema(domain, version);
+    }
+  });
+  for (int i = 0; i < 4; ++i) {
+    threads.emplace_back([&]() {
+      while (!start.load()) {
+        std::this_thread::yield();
+      }
+      const auto* schema = OpSchemaRegistry::Schema("Add", 13);
+#ifndef __ONNX_DISABLE_STATIC_REGISTRATION
+      EXPECT_NE(schema, nullptr);
+      EXPECT_FALSE(OpSchemaRegistry::get_all_schemas_with_history().empty());
+#else
+      (void)schema;
+      (void)OpSchemaRegistry::get_all_schemas_with_history();
+#endif
+    });
+  }
+  start = true;
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  EXPECT_EQ(OpSchemaRegistry::Schema("LifecycleOp", domain)->SinceVersion(), 100);
+  RemoveLifecycleDomain(domain);
+}
+
+TEST(SchemaRegistrationTest, DomainSnapshotsAreIndependent) {
+  auto& ranges = OpSchemaRegistry::DomainToVersionRange::Instance();
+  const auto domain = LifecycleDomain();
+  ranges.AddDomainToVersion(domain, 1, 4, 3);
+  const auto versions = ranges.MapSnapshot();
+  const auto releases = ranges.LastReleaseVersionMapSnapshot();
+  ranges.UpdateDomainToVersion(domain, 1, 8, 7);
+  EXPECT_EQ(versions.at(domain), std::make_pair(1, 4));
+  EXPECT_EQ(releases.at(domain), 3);
+  EXPECT_EQ(ranges.MapSnapshot().at(domain), std::make_pair(1, 8));
+  RemoveLifecycleDomain(domain);
+  EXPECT_EQ(versions.at(domain), std::make_pair(1, 4));
+  EXPECT_EQ(ranges.MapSnapshot().count(domain), 0);
+  EXPECT_EQ(ranges.LastReleaseVersionMapSnapshot().count(domain), 0);
+}
+
+TEST(SchemaRegistrationTest, CleanupPreservesSharedLiveVersions) {
+  auto& ranges = OpSchemaRegistry::DomainToVersionRange::Instance();
+  const auto domain = LifecycleDomain();
+  ranges.AddDomainToVersion(domain, 2, 4, 1);
+  ranges.UpdateDomainToVersion(domain, 1, 9, 8);
+  RegisterLifecycleSchema(domain, 1);
+  RegisterLifecycleSchema(domain, 9);
+  DeregisterSchema("LifecycleOp", 1, domain);
+  OpSchemaRegistry::RestoreDomainToVersionIfUnused(domain, true, 2, 4, 1);
+  EXPECT_EQ(ranges.MapSnapshot().at(domain), std::make_pair(1, 9));
+  EXPECT_EQ(ranges.LastReleaseVersionMapSnapshot().at(domain), 8);
+  OpSchemaRegistry::RestoreDomainToVersionIfUnused(domain, false, 0, 0, 0);
+  EXPECT_EQ(ranges.MapSnapshot().count(domain), 1);
+  DeregisterSchema("LifecycleOp", 9, domain);
+  OpSchemaRegistry::RestoreDomainToVersionIfUnused(domain, true, 2, 4, 1);
+  EXPECT_EQ(ranges.MapSnapshot().at(domain), std::make_pair(2, 4));
+  EXPECT_EQ(ranges.LastReleaseVersionMapSnapshot().at(domain), 1);
+  RemoveLifecycleDomain(domain);
+}
+
+TEST(SchemaRegistrationTest, RetentionCreatesAndWidensWithoutNarrowing) {
+  auto& ranges = OpSchemaRegistry::DomainToVersionRange::Instance();
+  const auto new_domain = LifecycleDomain();
+  ranges.RetainDomainToVersion(new_domain, 2, 5);
+  EXPECT_EQ(ranges.MapSnapshot().at(new_domain), std::make_pair(2, 5));
+  EXPECT_EQ(ranges.LastReleaseVersionMapSnapshot().at(new_domain), 5);
+  OpSchemaRegistry::RestoreDomainToVersionIfUnused(new_domain, false, 0, 0, 0);
+  EXPECT_EQ(ranges.MapSnapshot().count(new_domain), 1);
+
+  const auto existing_domain = LifecycleDomain();
+  ranges.AddDomainToVersion(existing_domain, 3, 7, 6);
+  ranges.RetainDomainToVersion(existing_domain, 2, 5, 4);
+  ranges.RetainDomainToVersion(existing_domain, 4, 9, 8);
+  ranges.RetainDomainToVersion(existing_domain, 4, 9, 8);
+  RegisterLifecycleSchema(existing_domain, 9);
+  DeregisterSchema("LifecycleOp", 9, existing_domain);
+  OpSchemaRegistry::RestoreDomainToVersionIfUnused(existing_domain, true, 3, 7, 6);
+  EXPECT_EQ(ranges.MapSnapshot().at(existing_domain), std::make_pair(2, 9));
+  EXPECT_EQ(ranges.LastReleaseVersionMapSnapshot().at(existing_domain), 8);
+}
+
+TEST(SchemaRegistrationTest, RegistrationFailureRollbackAndInvalidCleanup) {
+  auto& ranges = OpSchemaRegistry::DomainToVersionRange::Instance();
+  const auto domain = LifecycleDomain();
+  EXPECT_THROW(RegisterLifecycleSchema(domain), SchemaError);
+  EXPECT_EQ(OpSchemaRegistry::Schema("LifecycleOp", domain), nullptr);
+  EXPECT_THROW(OpSchemaRegistry::RestoreDomainToVersionIfUnused(domain, false, 0, 0, 0), SchemaError);
+  EXPECT_THROW(ranges.RetainDomainToVersion(domain, 5, 2), SchemaError);
+  EXPECT_EQ(ranges.MapSnapshot().count(domain), 0);
+
+  ranges.AddDomainToVersion(domain, 1, 2);
+  RegisterLifecycleSchema(domain);
+  EXPECT_THROW(RegisterLifecycleSchema(domain), SchemaError);
+  EXPECT_THROW(RegisterLifecycleSchema(domain, 3), SchemaError);
+  EXPECT_EQ(OpSchemaRegistry::Schema("LifecycleOp", domain)->SinceVersion(), 1);
+  EXPECT_THROW(OpSchemaRegistry::RestoreDomainToVersionIfUnused(domain, true, 2, 1, 1), SchemaError);
+  EXPECT_EQ(ranges.MapSnapshot().at(domain), std::make_pair(1, 2));
+  DeregisterSchema("LifecycleOp", 1, domain);
+  EXPECT_THROW(DeregisterSchema("LifecycleOp", 1, domain), SchemaError);
+  RemoveLifecycleDomain(domain);
+}
+
+TEST(SchemaRegistrationTest, ConcurrentSnapshotsEnumerationAndMutation) {
+  auto& ranges = OpSchemaRegistry::DomainToVersionRange::Instance();
+  const auto domain = LifecycleDomain();
+  ranges.AddDomainToVersion(domain, 1, 2);
+  std::atomic<bool> start{false};
+  std::vector<std::thread> threads;
+  threads.emplace_back([&]() {
+    while (!start.load()) {
+      std::this_thread::yield();
+    }
+    for (int i = 0; i < 100; ++i) {
+      ranges.UpdateDomainToVersion(domain, 1, 2 + i);
+      RegisterLifecycleSchema(domain);
+      DeregisterSchema("LifecycleOp", 1, domain);
+    }
+  });
+  for (int i = 0; i < 4; ++i) {
+    threads.emplace_back([&]() {
+      while (!start.load()) {
+        std::this_thread::yield();
+      }
+      for (int j = 0; j < 10; ++j) {
+        EXPECT_EQ(ranges.MapSnapshot().at(domain).first, 1);
+        EXPECT_GE(ranges.LastReleaseVersionMapSnapshot().at(domain), 2);
+        // Do not dereference the borrowed pointer: the writer may remove it.
+        (void)OpSchemaRegistry::Schema("LifecycleOp", domain);
+        (void)OpSchemaRegistry::Schema("LifecycleOp", 1, domain);
+        (void)OpSchemaRegistry::get_all_schemas();
+        (void)OpSchemaRegistry::get_all_schemas_with_history();
+      }
+    });
+  }
+  start = true;
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  RemoveLifecycleDomain(domain);
+}
+
+TEST(SchemaRegistrationTest, CallbackCaptureDestructionCanReenterRegistry) {
+  auto& ranges = OpSchemaRegistry::DomainToVersionRange::Instance();
+  const auto domain = LifecycleDomain();
+  ranges.AddDomainToVersion(domain, 1, 2);
+  std::atomic<int> destroyed{0};
+  struct Capture {
+    explicit Capture(std::atomic<int>& count) : destroyed(count) {}
+    std::atomic<int>& destroyed;
+    ~Capture() {
+      (void)OpSchemaRegistry::DomainToVersionRange::Instance().MapSnapshot();
+      (void)OpSchemaRegistry::get_all_schemas();
+      ++destroyed;
+    }
+  };
+  for (int version = 1; version <= 2; ++version) {
+    auto capture = std::make_shared<Capture>(destroyed);
+    auto schema = OpSchema().SetName("LifecycleOp").SetDomain(domain).SinceVersion(version);
+    schema.TypeAndShapeInferenceFunction([capture](InferenceContext&) {});
+    RegisterSchema(std::move(schema), 0, true, true);
+  }
+  DeregisterSchema("LifecycleOp", 1, domain);
+  EXPECT_EQ(destroyed, 1);
+  OpSchemaRegistry::OpSchemaDeregisterAll(domain);
+  EXPECT_EQ(destroyed, 2);
+  RemoveLifecycleDomain(domain);
 }
 
 // Schema of all versions are registered by default

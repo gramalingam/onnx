@@ -19,6 +19,20 @@ if TYPE_CHECKING:
 
 
 class TestSchema:
+    def test_domain_version_snapshot_is_independent(self) -> None:
+        domain = "test.schema.snapshot"
+        defs.C.set_domain_to_version(domain, 1, 2)
+        snapshot = defs.C.schema_version_map()
+        try:
+            defs.C.set_domain_to_version(domain, 1, 3)
+            assert snapshot[domain] == (1, 2)
+            current = defs.C.schema_version_map()
+            assert current[domain] == (1, 3)
+            current[domain] = (1, 99)
+            assert defs.C.schema_version_map()[domain] == (1, 3)
+        finally:
+            defs.C.set_domain_to_version(domain, 1, 2)
+
     @staticmethod
     def _tensor_type_proto(elem_type: int) -> onnx.TypeProto:
         type_proto = onnx.TypeProto()

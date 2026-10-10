@@ -293,7 +293,7 @@ static void VerifyFunction(const OpSchema& op, const FunctionProto* function_pro
   checker::CheckerContext ctx;
   std::unordered_map<std::string, int> op_set;
   GetFunctionProtoOpsetImport(op, function_proto, op_set);
-  auto version_range = OpSchemaRegistry::DomainToVersionRange::Instance().Map().at(op.domain());
+  auto version_range = OpSchemaRegistry::DomainToVersionRange::Instance().MapSnapshot().at(op.domain());
   if (op.since_version() > version_range.second || op.since_version() < version_range.first) {
     fail_check("Invalid function version in function op '", op.Name(), "'");
   }

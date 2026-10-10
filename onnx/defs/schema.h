@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <ostream>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -915,6 +916,11 @@ class ISchemaRegistry {
 
 /**
  * @brief A registry to hold all the operator schemas.
+ *
+ * Registry operations are synchronized, but Schema/GetSchema return borrowed
+ * pointers. Callers must prevent deregistration of a schema for the entire
+ * duration of its use, including inference/checking and callback execution.
+ * Registry synchronization alone does not make unloading a plugin safe.
  */
 class OpSchemaRegistry final : public ISchemaRegistry {
  public:
@@ -948,7 +954,19 @@ class OpSchemaRegistry final : public ISchemaRegistry {
       return map_;
     }
 
+    // Legacy reference accessors require external exclusion of domain mutations.
+    // Prefer snapshots when domains may be registered dynamically.
+    ONNX_API std::unordered_map<std::string, std::pair<int, int>> MapSnapshot() const {
+      std::lock_guard<std::mutex> lock(mutex_);
+      return map_;
+    }
+
     ONNX_API const std::unordered_map<std::string, int>& LastReleaseVersionMap() const {
+      return last_release_version_map_;
+    }
+
+    ONNX_API std::unordered_map<std::string, int> LastReleaseVersionMapSnapshot() const {
+      std::lock_guard<std::mutex> lock(mutex_);
       return last_release_version_map_;
     }
 
@@ -961,6 +979,7 @@ class OpSchemaRegistry final : public ISchemaRegistry {
     // as opposed to ONNX releases).
     ONNX_API void
     AddDomainToVersion(const std::string& domain, int min_version, int max_version, int last_release_version = -1) {
+      std::unique_lock<std::shared_mutex> registry_lock(Mutex());
       std::lock_guard<std::mutex> lock(mutex_);
       if (map_.count(domain) != 0) {
         std::stringstream err;
@@ -985,6 +1004,7 @@ class OpSchemaRegistry final : public ISchemaRegistry {
 
     ONNX_API void
     UpdateDomainToVersion(const std::string& domain, int min_version, int max_version, int last_release_version = -1) {
+      std::unique_lock<std::shared_mutex> registry_lock(Mutex());
       std::lock_guard<std::mutex> lock(mutex_);
       if (map_.count(domain) == 0) {
         std::stringstream err;
@@ -1007,6 +1027,11 @@ class OpSchemaRegistry final : public ISchemaRegistry {
       last_release_version_map_.at(domain) = last_release_version;
     }
 
+    // Permanently retain a domain for a registrar outside a temporary lifecycle.
+    // Create it if absent, otherwise widen (never narrow) its existing range.
+    ONNX_API void
+    RetainDomainToVersion(const std::string& domain, int min_version, int max_version, int last_release_version = -1);
+
     ONNX_API static DomainToVersionRange& Instance();
 
    private:
@@ -1018,7 +1043,9 @@ class OpSchemaRegistry final : public ISchemaRegistry {
     // version.
     std::unordered_map<std::string, int> last_release_version_map_;
 
-    std::mutex mutex_;
+    friend class OpSchemaRegistry;
+    std::unordered_set<std::string> retained_domains_;
+    mutable std::mutex mutex_;
   };
 
   class OpSchemaRegisterOnce final {
@@ -1044,20 +1071,30 @@ class OpSchemaRegistry final : public ISchemaRegistry {
     ONNX_API static void
     OpSchemaRegisterImpl(OpSchema&& op_schema, int opset_version_to_load = 0, bool fail_duplicate_schema = true) {
       op_schema.Finalize();
+      std::lock_guard<std::recursive_mutex> registration_lock(RegistrationMutex());
+      std::unique_lock<std::shared_mutex> lock(Mutex());
       auto& m = GetMapWithoutEnsuringRegistration();
       const auto& op_name = op_schema.Name();
       const auto& op_domain = op_schema.domain();
-      auto& schema_ver_map = m[op_name][op_domain];
       auto ver = op_schema.SinceVersion();
       if (OpSchema::kUninitializedSinceVersion == ver) {
         op_schema.SinceVersion(1);
         ver = op_schema.SinceVersion();
       }
 
+      const auto name_it = m.find(op_name);
+      const std::map<OperatorSetVersion, OpSchema>* existing_versions = nullptr;
+      if (name_it != m.end()) {
+        const auto domain_it = name_it->second.find(op_domain);
+        if (domain_it != name_it->second.end()) {
+          existing_versions = &domain_it->second;
+        }
+      }
+
       // Stops because the exact opset_version is registered
-      if (schema_ver_map.count(ver)) {
+      if (existing_versions != nullptr && existing_versions->count(ver)) {
         if (fail_duplicate_schema) {
-          const auto& schema = schema_ver_map[ver];
+          const auto& schema = existing_versions->at(ver);
           std::stringstream err;
           err << "Trying to register schema with name " << op_name << " (domain: " << op_domain << " version: " << ver
               << ") from file " << op_schema.file() << " line " << op_schema.line()
@@ -1074,8 +1111,8 @@ class OpSchemaRegistry final : public ISchemaRegistry {
         }
 
         // Stops because a later version is registered within target opset version
-        if (!schema_ver_map.empty()) {
-          int max_registered_ver_le_target = GetMaxRegisteredVerWithinTarget(schema_ver_map, opset_version_to_load);
+        if (existing_versions != nullptr && !existing_versions->empty()) {
+          int max_registered_ver_le_target = GetMaxRegisteredVerWithinTarget(*existing_versions, opset_version_to_load);
           if (max_registered_ver_le_target >= ver) {
             return;
           }
@@ -1083,7 +1120,7 @@ class OpSchemaRegistry final : public ISchemaRegistry {
       }
 
       CheckDomainAndVersionToRegister(op_schema, op_name, op_domain);
-      schema_ver_map.insert(std::pair<int, OpSchema&&>(ver, std::move(op_schema)));
+      m[op_name][op_domain].emplace(ver, std::move(op_schema));
     }
 
    private:
@@ -1104,7 +1141,7 @@ class OpSchemaRegistry final : public ISchemaRegistry {
         const OpSchema& op_schema,
         const std::string& op_name,
         const std::string& op_domain) {
-      auto ver_range_map = DomainToVersionRange::Instance().Map();
+      auto ver_range_map = DomainToVersionRange::Instance().MapSnapshot();
       auto ver_range_it = ver_range_map.find(op_domain);
       auto ver = op_schema.SinceVersion();
 
@@ -1134,29 +1171,38 @@ class OpSchemaRegistry final : public ISchemaRegistry {
 
   static void
   OpSchemaDeregister(const std::string& op_type, const int version, const std::string& domain = ONNX_DOMAIN) {
-    auto& schema_map = GetMapWithoutEnsuringRegistration();
-    if (schema_map.count(op_type) && schema_map[op_type].count(domain) && schema_map[op_type][domain].count(version)) {
-      schema_map[op_type][domain].erase(version);
-    } else {
-      std::stringstream err;
-      err << "Attempting to deregister an unregistered schema with name: " << op_type << " domain: " << domain
-          << " version: " << version << '\n';
-      fail_schema(err.str());
+    std::map<OperatorSetVersion, OpSchema>::node_type removed_schema;
+    {
+      std::lock_guard<std::recursive_mutex> registration_lock(RegistrationMutex());
+      std::unique_lock<std::shared_mutex> lock(Mutex());
+      auto& schema_map = GetMapWithoutEnsuringRegistration();
+      if (schema_map.count(op_type) && schema_map[op_type].count(domain) &&
+          schema_map[op_type][domain].count(version)) {
+        removed_schema = schema_map[op_type][domain].extract(version);
+      } else {
+        std::stringstream err;
+        err << "Attempting to deregister an unregistered schema with name: " << op_type << " domain: " << domain
+            << " version: " << version << '\n';
+        fail_schema(err.str());
+      }
     }
+    // Destroy callback captures only after releasing registry locks.
   }
 
   // Deregister all ONNX opset schemas from domain
   // Domain with default value ONNX_DOMAIN means ONNX.
   static void OpSchemaDeregisterAll(const std::string& domain = ONNX_DOMAIN) {
-    auto& schema_map = GetMapWithoutEnsuringRegistration();
-    // schema_map stores operator schemas in the format of
-    // <OpName, <Domain, <OperatorSetVersion, OpSchema>>>
-    for (auto&& [_, domain_map] : schema_map) {
-      if (domain_map.count(domain)) {
-        auto& opset_version_schema_map = domain_map[domain];
-        // Invalidates ver-schema pairs and frees memory, leaving m[op_name][op_domain] empty
-        opset_version_schema_map.clear();
-        domain_map.erase(domain);
+    std::vector<std::map<OperatorSetVersion, OpSchema>> removed_schemas;
+    {
+      std::lock_guard<std::recursive_mutex> registration_lock(RegistrationMutex());
+      std::unique_lock<std::shared_mutex> lock(Mutex());
+      auto& schema_map = GetMapWithoutEnsuringRegistration();
+      removed_schemas.reserve(schema_map.size());
+      for (auto&& [_, domain_map] : schema_map) {
+        if (domain_map.count(domain)) {
+          removed_schemas.emplace_back(std::move(domain_map.at(domain)));
+          domain_map.erase(domain);
+        }
       }
     }
   }
@@ -1164,11 +1210,12 @@ class OpSchemaRegistry final : public ISchemaRegistry {
   // Return the latest schema for an operator in specified domain.
   // Domain with default value ONNX_DOMAIN means ONNX.
   static const OpSchema* Schema(const std::string& key, const std::string& domain = ONNX_DOMAIN) {
-    auto& m = map();
-    if (m.count(key) && m[key].count(domain)) {
-      const auto& schema_ver_map = m[key][domain];
+    const auto& m = map();
+    std::shared_lock<std::shared_mutex> lock(Mutex());
+    if (m.count(key) && m.at(key).count(domain)) {
+      const auto& schema_ver_map = m.at(key).at(domain);
       if (!schema_ver_map.empty()) {
-        return &m[key][domain].rbegin()->second;
+        return &schema_ver_map.rbegin()->second;
       }
     }
     return nullptr;
@@ -1179,16 +1226,17 @@ class OpSchemaRegistry final : public ISchemaRegistry {
   // ONNX_DOMAIN means ONNX.
   ONNX_API static const OpSchema*
   Schema(const std::string& key, const int maxInclusiveVersion, const std::string& domain = ONNX_DOMAIN) {
-    auto& m = map();
-    if (m.count(key) && m[key].count(domain)) {
-      const auto& schema_ver_map = m[key][domain];
+    const auto& m = map();
+    std::shared_lock<std::shared_mutex> lock(Mutex());
+    if (m.count(key) && m.at(key).count(domain)) {
+      const auto& schema_ver_map = m.at(key).at(domain);
       if (!schema_ver_map.empty()) {
-        auto pos = m[key][domain].lower_bound(maxInclusiveVersion);
-        if (m[key][domain].begin() == pos && pos->first > maxInclusiveVersion) {
+        auto pos = schema_ver_map.lower_bound(maxInclusiveVersion);
+        if (schema_ver_map.begin() == pos && pos->first > maxInclusiveVersion) {
           // All versions are greater than specified version.
           return nullptr;
         }
-        if (m[key][domain].end() == pos || pos->first > maxInclusiveVersion) {
+        if (schema_ver_map.end() == pos || pos->first > maxInclusiveVersion) {
           // All versions are less than specified version, or,
           // The <pos> version is greater than specified version.
           pos--;
@@ -1211,9 +1259,11 @@ class OpSchemaRegistry final : public ISchemaRegistry {
     return Schema(key, maxInclusiveVersion, domain);
   }
   ONNX_API static void SetLoadedSchemaVersion(int target_version) {
+    std::unique_lock<std::shared_mutex> lock(Mutex());
     loaded_schema_version = target_version;
   }
   ONNX_API static int GetLoadedSchemaVersion() {
+    std::shared_lock<std::shared_mutex> lock(Mutex());
     return loaded_schema_version;
   }
 
@@ -1240,12 +1290,28 @@ class OpSchemaRegistry final : public ISchemaRegistry {
    */
   ONNX_API static OpName_Domain_Version_Schema_Map& GetMapWithoutEnsuringRegistration();
   ONNX_API static OpName_Domain_Version_Schema_Map& map();
+  ONNX_API static std::shared_mutex& Mutex();
+  // Serializes mutations with first-time initialization, whose registrations
+  // reenter this lock. Always acquire it before Mutex().
+  ONNX_API static std::recursive_mutex& RegistrationMutex();
   static int loaded_schema_version;
 
  public:
+  // Restore a caller's saved domain range only when no schemas remain and no
+  // permanent registrar retained the domain. See docs/SchemaRegistry.md for the
+  // caller's responsibility to coordinate shared domain lifecycles.
+  ONNX_API static void RestoreDomainToVersionIfUnused(
+      const std::string& domain,
+      bool had_original_range,
+      int min_version,
+      int max_version,
+      int last_release_version);
+
   static std::vector<OpSchema> get_all_schemas_with_history() {
+    auto& schema_map = map();
+    std::shared_lock<std::shared_mutex> lock(Mutex());
     std::vector<OpSchema> r;
-    for (auto& x : map()) {
+    for (auto& x : schema_map) {
       for (auto& y : x.second) {
         for (auto& z : y.second) {
           r.emplace_back(z.second);
@@ -1256,8 +1322,10 @@ class OpSchemaRegistry final : public ISchemaRegistry {
   }
 
   static std::vector<OpSchema> get_all_schemas() {
+    auto& schema_map = map();
+    std::shared_lock<std::shared_mutex> lock(Mutex());
     std::vector<OpSchema> r;
-    for (auto& x : map()) {
+    for (auto& x : schema_map) {
       for (auto& y : x.second) {
         if (!y.second.empty()) {
           r.emplace_back(y.second.rbegin()->second);

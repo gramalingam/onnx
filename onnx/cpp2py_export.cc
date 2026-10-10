@@ -528,7 +528,7 @@ NB_MODULE(onnx_cpp2py_export, onnx_cpp2py_export) { // NOLINT(cppcoreguidelines-
       .def(
           "schema_version_map",
           []() -> std::unordered_map<std::string, std::pair<int, int>> {
-            return OpSchemaRegistry::DomainToVersionRange::Instance().Map();
+            return OpSchemaRegistry::DomainToVersionRange::Instance().MapSnapshot();
           })
       .def(
           "get_schema",
@@ -569,7 +569,7 @@ NB_MODULE(onnx_cpp2py_export, onnx_cpp2py_export) { // NOLINT(cppcoreguidelines-
           "set_domain_to_version",
           [](const std::string& domain, int min_version, int max_version, int last_release_version) {
             auto& obj = OpSchemaRegistry::DomainToVersionRange::Instance();
-            if (obj.Map().count(domain) == 0) {
+            if (obj.MapSnapshot().count(domain) == 0) {
               obj.AddDomainToVersion(domain, min_version, max_version, last_release_version);
             } else {
               obj.UpdateDomainToVersion(domain, min_version, max_version, last_release_version);

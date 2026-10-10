@@ -120,7 +120,7 @@ class DefaultVersionConverter : public BaseVersionConverter {
  public:
   DefaultVersionConverter() {
     const std::unordered_map<std::string, std::pair<int, int>>& versions_map =
-        OpSchemaRegistry::DomainToVersionRange::Instance().Map();
+        OpSchemaRegistry::DomainToVersionRange::Instance().MapSnapshot();
     version_range = versions_map.at("");
     // Register adapters to the version converter
     const std::vector<OpSchema> all_opschemas = OpSchemaRegistry::get_all_schemas_with_history();
