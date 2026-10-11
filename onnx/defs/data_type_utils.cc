@@ -143,6 +143,9 @@ std::string DataTypeUtils::ToString(const TypeProto& type_proto, const std::stri
       result.append(")").append(right);
       return result;
     }
+    case TypeProto::ValueCase::kKvCacheType: {
+      return left + "kv_cache(" + ToDataTypeString(type_proto.kv_cache_type().elem_type()) + ")" + right;
+    }
     case TypeProto::ValueCase::kSparseTensorType: {
       // Note: We do not distinguish tensors with zero rank (a shape consisting
       // of an empty sequence of dimensions) here.
@@ -202,6 +205,12 @@ void DataTypeUtils::FromString(const std::string& type_str, TypeProto& type_prot
         opaque_type->mutable_name()->assign(s.Data(), s.Size());
       }
     }
+    return;
+  }
+  if (s.LStrip("kv_cache")) {
+    s.ParensWhitespaceStrip();
+    auto elem_type = FromDataTypeString(std::string(s.Data(), s.Size()));
+    type_proto.mutable_kv_cache_type()->set_elem_type(elem_type);
     return;
   }
   if (s.LStrip("sparse_tensor")) {

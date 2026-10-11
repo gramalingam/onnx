@@ -1519,11 +1519,18 @@ class OpSet_Onnx_ver28 {
 };
 
 // Iterate over schema from ai.onnx version 29
+class ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Onnx, 29, KVCacheCreate);
+class ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Onnx, 29, AttentionWithCache);
+class ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Onnx, 29, KVCacheExport);
+class ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Onnx, 29, KVCacheDescribe);
+
 class OpSet_Onnx_ver29 {
  public:
   static void ForEachSchema(const std::function<void(OpSchema&&)>& fn) {
-    // TODO: Remove after introducing the first schema to opset 29
-    (void)fn;
+    fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Onnx, 29, KVCacheCreate)>());
+    fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Onnx, 29, AttentionWithCache)>());
+    fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Onnx, 29, KVCacheExport)>());
+    fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Onnx, 29, KVCacheDescribe)>());
   }
 };
 

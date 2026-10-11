@@ -80,6 +80,8 @@ class ProtoPrinter {
 
   void print(const TypeProto_Opaque& opaqueType);
 
+  void print(const TypeProto_KVCache& cacheType);
+
   void print(const TensorProto& tensor, bool is_initializer = false);
 
   void print(const ValueInfoProto& value_info);
@@ -266,6 +268,35 @@ void ProtoPrinter::print(const TypeProto_Opaque& opaqueType) {
   output_ << ")";
 }
 
+void ProtoPrinter::print(const TypeProto_KVCache& cacheType) {
+  output_ << "kv_cache(" << PrimitiveTypeNameMap::ToString(cacheType.elem_type()) << ")";
+  const bool has_geometry = cacheType.has_batch_size() || cacheType.has_num_kv_heads() ||
+      cacheType.has_key_head_size() || cacheType.has_value_head_size();
+  if (has_geometry) {
+    output_ << "[";
+    const TensorShapeProto_Dimension* dims[] = {
+        cacheType.has_batch_size() ? &cacheType.batch_size() : nullptr,
+        cacheType.has_num_kv_heads() ? &cacheType.num_kv_heads() : nullptr,
+        cacheType.has_key_head_size() ? &cacheType.key_head_size() : nullptr,
+        cacheType.has_value_head_size() ? &cacheType.value_head_size() : nullptr,
+    };
+    for (size_t i = 0; i < 4; ++i) {
+      if (i != 0) {
+        output_ << ",";
+      }
+      if (dims[i] != nullptr) {
+        print(*dims[i]);
+      } else {
+        output_ << "?";
+      }
+    }
+    output_ << "]";
+  }
+  if (cacheType.has_sliding_window()) {
+    output_ << ";" << cacheType.sliding_window();
+  }
+}
+
 void ProtoPrinter::print(const TypeProto& type) {
   if (type.has_tensor_type())
     print(type.tensor_type());
@@ -279,6 +310,8 @@ void ProtoPrinter::print(const TypeProto& type) {
     print(type.sparse_tensor_type());
   else if (type.has_opaque_type())
     print(type.opaque_type());
+  else if (type.has_kv_cache_type())
+    print(type.kv_cache_type());
 }
 
 void ProtoPrinter::print(const TensorProto& tensor, bool is_initializer) {

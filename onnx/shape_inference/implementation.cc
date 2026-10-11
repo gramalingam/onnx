@@ -40,6 +40,8 @@ std::string GetValueCaseString(const TypeProto& type) {
       return "opaque_type";
     case TypeProto::ValueCase::kSparseTensorType:
       return "sparse_tensor_type";
+    case TypeProto::ValueCase::kKvCacheType:
+      return "kv_cache_type";
     case TypeProto::ValueCase::VALUE_NOT_SET:
       return "NOT_SET";
   }
@@ -106,6 +108,34 @@ static void CheckTensorShapesAndTypes(const T& inferred_type, const T& existing_
   }
 }
 
+static void CheckKVCacheTypes(const TypeProto_KVCache& inferred_type, const TypeProto_KVCache& existing_type) {
+  if (inferred_type.elem_type() != TensorProto::UNDEFINED && existing_type.elem_type() != TensorProto::UNDEFINED &&
+      inferred_type.elem_type() != existing_type.elem_type()) {
+    fail_type_inference("Inferred and existing KV-cache element types differ.");
+  }
+  if (inferred_type.sliding_window() != existing_type.sliding_window()) {
+    fail_type_inference("Inferred and existing KV-cache sliding_window values differ.");
+  }
+  const TensorShapeProto_Dimension* inferred_dims[] = {
+      inferred_type.has_batch_size() ? &inferred_type.batch_size() : nullptr,
+      inferred_type.has_num_kv_heads() ? &inferred_type.num_kv_heads() : nullptr,
+      inferred_type.has_key_head_size() ? &inferred_type.key_head_size() : nullptr,
+      inferred_type.has_value_head_size() ? &inferred_type.value_head_size() : nullptr,
+  };
+  const TensorShapeProto_Dimension* existing_dims[] = {
+      existing_type.has_batch_size() ? &existing_type.batch_size() : nullptr,
+      existing_type.has_num_kv_heads() ? &existing_type.num_kv_heads() : nullptr,
+      existing_type.has_key_head_size() ? &existing_type.key_head_size() : nullptr,
+      existing_type.has_value_head_size() ? &existing_type.value_head_size() : nullptr,
+  };
+  for (size_t i = 0; i < 4; ++i) {
+    if (inferred_dims[i] != nullptr && existing_dims[i] != nullptr && inferred_dims[i]->has_dim_value() &&
+        existing_dims[i]->has_dim_value() && inferred_dims[i]->dim_value() != existing_dims[i]->dim_value()) {
+      fail_type_inference("Inferred and existing KV-cache logical dimensions differ at index ", i, ".");
+    }
+  }
+}
+
 void checkShapesAndTypes(const TypeProto& inferred_type, const TypeProto& existing_type) {
   const auto inferred_value_case = inferred_type.value_case();
   const auto existing_value_case = existing_type.value_case();
@@ -156,6 +186,8 @@ void checkShapesAndTypes(const TypeProto& inferred_type, const TypeProto& existi
       fail_type_inference(
           "name mismatch for opaque type: existing=", existing_opaque.name(), " inferred=", inferred_opaque.name());
     }
+  } else if (inferred_value_case == TypeProto::kKvCacheType && existing_value_case == TypeProto::kKvCacheType) {
+    CheckKVCacheTypes(inferred_type.kv_cache_type(), existing_type.kv_cache_type());
   } else {
     fail_type_inference("type case unsupported. existing=", existing_value_case, " inferred=", inferred_value_case);
   }
@@ -235,6 +267,27 @@ void mergeShapesAndTypes(const TypeProto& inferred_type, TypeProto* existing_typ
     if (!existing_opaque->has_name() && inferred_opaque.has_name()) {
       existing_opaque->set_name(inferred_opaque.name());
     }
+  } else if (inferred_val_case == TypeProto::kKvCacheType) {
+    auto* existing_cache = existing_type->mutable_kv_cache_type();
+    const auto& inferred_cache = inferred_type.kv_cache_type();
+    if (existing_cache->elem_type() == TensorProto::UNDEFINED) {
+      existing_cache->set_elem_type(inferred_cache.elem_type());
+    }
+    if (!existing_cache->has_batch_size() && inferred_cache.has_batch_size()) {
+      existing_cache->mutable_batch_size()->CopyFrom(inferred_cache.batch_size());
+    }
+    if (!existing_cache->has_num_kv_heads() && inferred_cache.has_num_kv_heads()) {
+      existing_cache->mutable_num_kv_heads()->CopyFrom(inferred_cache.num_kv_heads());
+    }
+    if (!existing_cache->has_key_head_size() && inferred_cache.has_key_head_size()) {
+      existing_cache->mutable_key_head_size()->CopyFrom(inferred_cache.key_head_size());
+    }
+    if (!existing_cache->has_value_head_size() && inferred_cache.has_value_head_size()) {
+      existing_cache->mutable_value_head_size()->CopyFrom(inferred_cache.value_head_size());
+    }
+    if (!existing_cache->has_sliding_window() && inferred_cache.has_sliding_window()) {
+      existing_cache->set_sliding_window(inferred_cache.sliding_window());
+    }
   }
 }
 
@@ -271,6 +324,9 @@ void MaterializeSymbolicShape(TypeProto* inferred_type, SymbolTable& symbol_tabl
     MaterializeSymbolicShape(inferred_type->mutable_map_type()->mutable_value_type(), symbol_table);
   } else if (inferred_val_case == TypeProto::kOpaqueType) {
     // Opaque types have no shape to materialize.
+    return;
+  } else if (inferred_val_case == TypeProto::kKvCacheType) {
+    // KV-cache logical dimensions are metadata, not a tensor shape.
     return;
   } else {
     fail_shape_inference("type case unsupported for symbolic shape inference. inferred=", inferred_val_case);

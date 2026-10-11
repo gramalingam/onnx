@@ -6,6 +6,12 @@ SPDX-License-Identifier: Apache-2.0
 
 # ONNX Types
 
+## Experimental KV-cache type
+
+The dedicated KV-cache TypeProto described in
+[experimental/KVCache.md](experimental/KVCache.md) is a coordinated fork
+prototype only; it is not an adopted ONNX standard feature.
+
 ## Opaque Type
 
 An Opaque type (`TypeProto.Opaque`) enables the definition of user-defined

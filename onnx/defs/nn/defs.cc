@@ -3599,6 +3599,323 @@ ONNX_OPERATOR_SET_SCHEMA(
           return true;
         }));
 
+namespace {
+
+const TypeProto::KVCache* GetKVCacheType(const InferenceContext& ctx, size_t input_index) {
+  const auto* type = ctx.getInputType(input_index);
+  return type != nullptr && type->has_kv_cache_type() ? &type->kv_cache_type() : nullptr;
+}
+
+void SetCacheDimension(
+    TypeProto::KVCache& cache_type,
+    const std::string& field,
+    const AttributeProto* attr,
+    bool strictly_positive = false) {
+  if (attr == nullptr) {
+    return;
+  }
+  const int64_t value = attr->i();
+  if (strictly_positive ? value <= 0 : value < 0) {
+    fail_shape_inference("KVCacheCreate attribute ", field, " has invalid value ", value, ".");
+  }
+  TensorShapeProto_Dimension* dim = nullptr;
+  if (field == "batch_size") {
+    dim = cache_type.mutable_batch_size();
+  } else if (field == "num_kv_heads") {
+    dim = cache_type.mutable_num_kv_heads();
+  } else if (field == "key_head_size") {
+    dim = cache_type.mutable_key_head_size();
+  } else {
+    dim = cache_type.mutable_value_head_size();
+  }
+  dim->set_dim_value(value);
+}
+
+void CopyCacheDimension(
+    const TypeProto::KVCache& cache_type,
+    const std::string& field,
+    TensorShapeProto_Dimension* output_dim) {
+  if (field == "batch_size" && cache_type.has_batch_size()) {
+    output_dim->CopyFrom(cache_type.batch_size());
+  } else if (field == "num_kv_heads" && cache_type.has_num_kv_heads()) {
+    output_dim->CopyFrom(cache_type.num_kv_heads());
+  } else if (field == "key_head_size" && cache_type.has_key_head_size()) {
+    output_dim->CopyFrom(cache_type.key_head_size());
+  } else if (field == "value_head_size" && cache_type.has_value_head_size()) {
+    output_dim->CopyFrom(cache_type.value_head_size());
+  }
+}
+
+void CheckCacheDimension(
+    const TensorShapeProto_Dimension& input_dim,
+    const TensorShapeProto_Dimension& cache_dim,
+    const char* description) {
+  if (input_dim.has_dim_value() && cache_dim.has_dim_value() && input_dim.dim_value() != cache_dim.dim_value()) {
+    fail_shape_inference(
+        description, " does not match the KV-cache type (", input_dim.dim_value(), " vs ", cache_dim.dim_value(), ").");
+  }
+}
+
+void InferKVCacheCreate(InferenceContext& ctx) {
+  const auto* elem_type = ctx.getAttribute("elem_type");
+  if (elem_type == nullptr) {
+    fail_shape_inference("KVCacheCreate requires elem_type.");
+  }
+  if (elem_type->i() != TensorProto::FLOAT && elem_type->i() != TensorProto::FLOAT16 &&
+      elem_type->i() != TensorProto::BFLOAT16) {
+    fail_shape_inference("KVCacheCreate elem_type must be FLOAT, FLOAT16, or BFLOAT16.");
+  }
+  const auto* window = ctx.getAttribute("sliding_window");
+  if (window != nullptr && window->i() < 0) {
+    fail_shape_inference("KVCacheCreate sliding_window must be nonnegative.");
+  }
+  auto* output_type = ctx.getOutputType(0);
+  if (output_type == nullptr) {
+    return;
+  }
+  auto* cache_type = output_type->mutable_kv_cache_type();
+  cache_type->set_elem_type(elem_type->i());
+  cache_type->set_sliding_window(window == nullptr ? 0 : window->i());
+  SetCacheDimension(*cache_type, "batch_size", ctx.getAttribute("batch_size"));
+  SetCacheDimension(*cache_type, "num_kv_heads", ctx.getAttribute("num_kv_heads"), true);
+  SetCacheDimension(*cache_type, "key_head_size", ctx.getAttribute("key_head_size"), true);
+  SetCacheDimension(*cache_type, "value_head_size", ctx.getAttribute("value_head_size"), true);
+}
+
+void InferAttentionWithCache(InferenceContext& ctx) {
+  const auto* cache_type = GetKVCacheType(ctx, 3);
+  if (cache_type == nullptr) {
+    fail_shape_inference("AttentionWithCache requires a KV-cache input.");
+  }
+  const auto* window = ctx.getAttribute("sliding_window");
+  const int64_t sliding_window = window == nullptr ? 0 : window->i();
+  if (sliding_window < 0 || sliding_window != cache_type->sliding_window()) {
+    fail_shape_inference("AttentionWithCache sliding_window must match the cache type and be nonnegative.");
+  }
+  const auto* is_causal = ctx.getAttribute("is_causal");
+  if (sliding_window > 0 && (is_causal == nullptr || is_causal->i() != 1)) {
+    fail_shape_inference("AttentionWithCache requires is_causal=1 for a sliding window.");
+  }
+
+  const auto* q_type = ctx.getInputType(0);
+  const auto* k_type = ctx.getInputType(1);
+  const auto* v_type = ctx.getInputType(2);
+  if (q_type == nullptr || k_type == nullptr || v_type == nullptr || !q_type->has_tensor_type() ||
+      !k_type->has_tensor_type() || !v_type->has_tensor_type()) {
+    fail_shape_inference("AttentionWithCache Q, K_new, and V_new must be tensors.");
+  }
+  if (q_type->tensor_type().elem_type() != cache_type->elem_type() ||
+      k_type->tensor_type().elem_type() != cache_type->elem_type() ||
+      v_type->tensor_type().elem_type() != cache_type->elem_type()) {
+    fail_shape_inference("AttentionWithCache tensor element types must match the KV-cache payload type.");
+  }
+
+  if (hasInputShape(ctx, 0) && getInputShape(ctx, 0).dim_size() != 4) {
+    fail_shape_inference("AttentionWithCache Q must have rank 4 (BNSD).");
+  }
+  for (size_t input_index : {size_t{1}, size_t{2}}) {
+    if (hasInputShape(ctx, input_index) && getInputShape(ctx, input_index).dim_size() != 4) {
+      fail_shape_inference("AttentionWithCache K_new and V_new must have rank 4 (BNSD).");
+    }
+  }
+  if (hasInputShape(ctx, 0) && hasInputShape(ctx, 1) && hasInputShape(ctx, 2)) {
+    const auto& q_shape = getInputShape(ctx, 0);
+    const auto& k_shape = getInputShape(ctx, 1);
+    const auto& v_shape = getInputShape(ctx, 2);
+    for (int dim : {0, 2}) {
+      if (q_shape.dim(dim).has_dim_value() && k_shape.dim(dim).has_dim_value() &&
+          q_shape.dim(dim).dim_value() != k_shape.dim(dim).dim_value()) {
+        fail_shape_inference("AttentionWithCache Q and K_new batch/sequence dimensions must match.");
+      }
+      if (q_shape.dim(dim).has_dim_value() && v_shape.dim(dim).has_dim_value() &&
+          q_shape.dim(dim).dim_value() != v_shape.dim(dim).dim_value()) {
+        fail_shape_inference("AttentionWithCache Q and V_new batch/sequence dimensions must match.");
+      }
+    }
+    if (k_shape.dim(2).has_dim_value() && v_shape.dim(2).has_dim_value() &&
+        k_shape.dim(2).dim_value() != v_shape.dim(2).dim_value()) {
+      fail_shape_inference("AttentionWithCache K_new and V_new sequence lengths must match.");
+    }
+    CheckCacheDimension(q_shape.dim(0), cache_type->batch_size(), "Q batch size");
+    CheckCacheDimension(k_shape.dim(0), cache_type->batch_size(), "K_new batch size");
+    CheckCacheDimension(v_shape.dim(0), cache_type->batch_size(), "V_new batch size");
+    CheckCacheDimension(k_shape.dim(1), cache_type->num_kv_heads(), "K_new KV head count");
+    CheckCacheDimension(v_shape.dim(1), cache_type->num_kv_heads(), "V_new KV head count");
+    CheckCacheDimension(k_shape.dim(3), cache_type->key_head_size(), "K_new head size");
+    CheckCacheDimension(v_shape.dim(3), cache_type->value_head_size(), "V_new head size");
+    if (q_shape.dim(3).has_dim_value() && k_shape.dim(3).has_dim_value() &&
+        q_shape.dim(3).dim_value() != k_shape.dim(3).dim_value()) {
+      fail_shape_inference("AttentionWithCache Q and K_new head sizes must match.");
+    }
+    if (q_shape.dim(1).has_dim_value() && k_shape.dim(1).has_dim_value() && k_shape.dim(1).dim_value() > 0 &&
+        q_shape.dim(1).dim_value() % k_shape.dim(1).dim_value() != 0) {
+      fail_shape_inference("AttentionWithCache query head count must be divisible by KV head count.");
+    }
+  }
+
+  if (auto* output_cache = ctx.getOutputType(1)) {
+    output_cache->CopyFrom(*ctx.getInputType(3));
+  }
+  auto* output = ctx.getOutputType(0);
+  if (output == nullptr) {
+    return;
+  }
+  auto* output_tensor = output->mutable_tensor_type();
+  output_tensor->set_elem_type(q_type->tensor_type().elem_type());
+  if (hasInputShape(ctx, 0)) {
+    auto* output_shape = output_tensor->mutable_shape();
+    output_shape->CopyFrom(getInputShape(ctx, 0));
+    if (hasInputShape(ctx, 2)) {
+      output_shape->mutable_dim(3)->CopyFrom(getInputShape(ctx, 2).dim(3));
+    } else if (cache_type->has_value_head_size()) {
+      output_shape->mutable_dim(3)->CopyFrom(cache_type->value_head_size());
+    } else {
+      output_shape->mutable_dim(3)->Clear();
+    }
+  }
+}
+
+void InferKVCacheExport(InferenceContext& ctx) {
+  const auto* cache_type = GetKVCacheType(ctx, 0);
+  if (cache_type == nullptr) {
+    fail_shape_inference("KVCacheExport requires a KV-cache input.");
+  }
+  for (size_t output_index = 0; output_index < 2; ++output_index) {
+    auto* type = ctx.getOutputType(output_index);
+    if (type == nullptr) {
+      continue;
+    }
+    auto* tensor = type->mutable_tensor_type();
+    tensor->set_elem_type(cache_type->elem_type());
+    auto* shape = tensor->mutable_shape();
+    CopyCacheDimension(*cache_type, "batch_size", shape->add_dim());
+    CopyCacheDimension(*cache_type, "num_kv_heads", shape->add_dim());
+    shape->add_dim();
+    CopyCacheDimension(*cache_type, output_index == 0 ? "key_head_size" : "value_head_size", shape->add_dim());
+  }
+  if (auto* positions = ctx.getOutputType(2)) {
+    auto* tensor = positions->mutable_tensor_type();
+    tensor->set_elem_type(TensorProto::INT64);
+    auto* shape = tensor->mutable_shape();
+    CopyCacheDimension(*cache_type, "batch_size", shape->add_dim());
+    shape->add_dim();
+  }
+}
+
+void InferKVCacheDescribe(InferenceContext& ctx) {
+  const auto* cache_type = GetKVCacheType(ctx, 0);
+  if (cache_type == nullptr) {
+    fail_shape_inference("KVCacheDescribe requires a KV-cache input.");
+  }
+  if (auto* lengths = ctx.getOutputType(0)) {
+    auto* tensor = lengths->mutable_tensor_type();
+    tensor->set_elem_type(TensorProto::INT64);
+    CopyCacheDimension(*cache_type, "batch_size", tensor->mutable_shape()->add_dim());
+  }
+  if (auto* ranges = ctx.getOutputType(1)) {
+    auto* tensor = ranges->mutable_tensor_type();
+    tensor->set_elem_type(TensorProto::INT64);
+    auto* shape = tensor->mutable_shape();
+    CopyCacheDimension(*cache_type, "batch_size", shape->add_dim());
+    shape->add_dim()->set_dim_value(2);
+  }
+}
+
+} // namespace
+
+ONNX_OPERATOR_SET_SCHEMA(
+    KVCacheCreate,
+    29,
+    OpSchema()
+        .SetDoc(
+            "EXPERIMENTAL coordinated ONNX fork prototype (not an adopted ONNX standard feature). "
+            "Creates an empty logical key/value attention cache. The cache value is runtime-owned; this "
+            "schema describes only payload dtype, logical geometry, and sliding-window semantics.")
+        .Attr("elem_type", "Element type for key and value payloads.", AttributeProto::INT)
+        .Attr("batch_size", "Optional logical batch size.", AttributeProto::INT, OPTIONAL_VALUE)
+        .Attr("num_kv_heads", "Optional number of key/value heads.", AttributeProto::INT, OPTIONAL_VALUE)
+        .Attr("key_head_size", "Optional key head width.", AttributeProto::INT, OPTIONAL_VALUE)
+        .Attr("value_head_size", "Optional value head width.", AttributeProto::INT, OPTIONAL_VALUE)
+        .Attr("sliding_window", "Logical causal window size; 0 means full history.", AttributeProto::INT, int64_t{0})
+        .Output(0, "cache", "New empty cache value.", "TC")
+        .TypeConstraint("TC", {"kv_cache(float)", "kv_cache(float16)", "kv_cache(bfloat16)"}, "KV-cache payload types.")
+        .TypeAndShapeInferenceFunction(InferKVCacheCreate));
+
+ONNX_OPERATOR_SET_SCHEMA(
+    AttentionWithCache,
+    29,
+    OpSchema()
+        .SetDoc(
+            "EXPERIMENTAL coordinated ONNX fork prototype (not an adopted ONNX standard feature). "
+            "Appends K_new and V_new to a logical cache value and computes attention over the resulting "
+            "history. Values are immutable versions: implementations may reuse storage only when doing so "
+            "cannot mutate any still-observable input version. Inputs use BNSD layout. A positive "
+            "sliding_window requires is_causal=1 and must match the cache type.")
+        .Attr("is_causal", "Whether causal masking is applied.", AttributeProto::INT, int64_t{0})
+        .Attr(
+            "scale",
+            "Scale applied to Q*K^T; default is 1/sqrt(key_head_size).",
+            AttributeProto::FLOAT,
+            OPTIONAL_VALUE)
+        .Attr("q_num_heads", "Optional query head count metadata.", AttributeProto::INT, OPTIONAL_VALUE)
+        .Attr("kv_num_heads", "Optional KV head count metadata.", AttributeProto::INT, OPTIONAL_VALUE)
+        .Attr("softmax_precision", "Optional precision used for softmax.", AttributeProto::INT, OPTIONAL_VALUE)
+        .Attr("softcap", "Soft cap for attention logits; zero disables soft capping.", AttributeProto::FLOAT, float{0})
+        .Attr(
+            "sliding_window",
+            "Logical causal window size; must match the cache type.",
+            AttributeProto::INT,
+            int64_t{0})
+        .Input(0, "Q", "Queries in BNSD layout.", "T")
+        .Input(1, "K_new", "New key vectors in BNSD layout.", "T")
+        .Input(2, "V_new", "New value vectors in BNSD layout.", "T")
+        .Input(3, "cache", "Input immutable cache version.", "TC")
+        .Input(4, "attn_mask", "Optional mask over logical key positions.", "U", OpSchema::Optional)
+        .Input(
+            5,
+            "positions",
+            "Optional contiguous absolute positions for new tokens, int64[B,Sk].",
+            "tensor(int64)",
+            OpSchema::Optional)
+        .Output(0, "Y", "Attention output in BNSD layout.", "T")
+        .Output(1, "cache_next", "Updated immutable cache version.", "TC")
+        .TypeConstraint("T", {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"}, "Attention payload type.")
+        .TypeConstraint("TC", {"kv_cache(float)", "kv_cache(float16)", "kv_cache(bfloat16)"}, "KV-cache payload type.")
+        .TypeConstraint(
+            "U",
+            {"tensor(bool)", "tensor(float)", "tensor(float16)", "tensor(bfloat16)"},
+            "Boolean or floating-point attention mask.")
+        .TypeAndShapeInferenceFunction(InferAttentionWithCache));
+
+ONNX_OPERATOR_SET_SCHEMA(
+    KVCacheExport,
+    29,
+    OpSchema()
+        .SetDoc(
+            "EXPERIMENTAL coordinated ONNX fork prototype (not an adopted ONNX standard feature). "
+            "Materializes retained logical cache entries in increasing position order. This diagnostic operator "
+            "may require a gather or transfer and is not required for attention execution.")
+        .Input(0, "cache", "Input cache value.", "TC")
+        .Output(0, "K", "Retained keys in BNSD layout.", "T")
+        .Output(1, "V", "Retained values in BNSD layout.", "T")
+        .Output(2, "positions", "Absolute logical positions, int64[B,S].", "tensor(int64)")
+        .TypeConstraint("TC", {"kv_cache(float)", "kv_cache(float16)", "kv_cache(bfloat16)"}, "KV-cache payload type.")
+        .TypeConstraint("T", {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"}, "Payload type.")
+        .TypeAndShapeInferenceFunction(InferKVCacheExport));
+
+ONNX_OPERATOR_SET_SCHEMA(
+    KVCacheDescribe,
+    29,
+    OpSchema()
+        .SetDoc(
+            "EXPERIMENTAL coordinated ONNX fork prototype (not an adopted ONNX standard feature). "
+            "Returns logical computed lengths and half-open retained ranges [start,end) for each batch row.")
+        .Input(0, "cache", "Input cache value.", "TC")
+        .Output(0, "lengths", "Computed end positions, int64[B].", "tensor(int64)")
+        .Output(1, "retained_range", "Retained half-open ranges [start,end), int64[B,2].", "tensor(int64)")
+        .TypeConstraint("TC", {"kv_cache(float)", "kv_cache(float16)", "kv_cache(bfloat16)"}, "KV-cache payload type.")
+        .TypeAndShapeInferenceFunction(InferKVCacheDescribe));
+
 ONNX_OPERATOR_SET_SCHEMA(
     CausalConvWithState,
     27,

@@ -148,6 +148,7 @@ class KeyWordMap {
     OPTIONAL_TYPE,
     SPARSE_TENSOR_TYPE,
     OPAQUE_TYPE,
+    KV_CACHE_TYPE,
     OVERLOAD_KW
   };
 
@@ -165,6 +166,7 @@ class KeyWordMap {
     map_["optional"] = KeyWord::OPTIONAL_TYPE;
     map_["sparse_tensor"] = KeyWord::SPARSE_TENSOR_TYPE;
     map_["opaque"] = KeyWord::OPAQUE_TYPE;
+    map_["kv_cache"] = KeyWord::KV_CACHE_TYPE;
     map_["overload"] = KeyWord::OVERLOAD_KW;
   }
 

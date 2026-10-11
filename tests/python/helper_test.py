@@ -782,6 +782,32 @@ class TestHelperTensorFunctions:
         vi = helper.make_tensor_value_info("Y", TensorProto.FLOAT, ())
         checker.check_value_info(vi)
 
+    def test_make_kv_cache_type(self) -> None:
+        vi = helper.make_kv_cache_type(
+            "cache",
+            TensorProto.FLOAT16,
+            batch_size=2,
+            num_kv_heads="kv_heads",
+            key_head_size=64,
+            value_head_size=80,
+            sliding_window=128,
+        )
+        assert vi.type.HasField("kv_cache_type")
+        cache_type = vi.type.kv_cache_type
+        assert cache_type.elem_type == TensorProto.FLOAT16
+        assert cache_type.batch_size.dim_value == 2
+        assert cache_type.num_kv_heads.dim_param == "kv_heads"
+        assert cache_type.key_head_size.dim_value == 64
+        assert cache_type.value_head_size.dim_value == 80
+        assert cache_type.sliding_window == 128
+        checker.check_value_info(vi)
+
+    def test_make_kv_cache_type_rejects_invalid_geometry(self) -> None:
+        with pytest.raises(ValueError, match="num_kv_heads must be positive"):
+            helper.make_kv_cache_type_proto(TensorProto.FLOAT, num_kv_heads=0)
+        with pytest.raises(ValueError, match="sliding_window must be nonnegative"):
+            helper.make_kv_cache_type_proto(TensorProto.FLOAT, sliding_window=-1)
+
     def test_make_sparse_tensor_value_info(self) -> None:
         vi = helper.make_sparse_tensor_value_info("X", TensorProto.FLOAT, (2, 3))
         checker.check_value_info(vi)

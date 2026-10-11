@@ -488,6 +488,42 @@ Common::Status OnnxParser::Parse(TypeProto& typeProto) {
         }
         break;
       }
+      case KeyWordMap::KeyWord::KV_CACHE_TYPE: {
+        // Grammar: kv_cache(elem_type)[batch_size, num_kv_heads, key_head_size, value_head_size];sliding_window
+        // Geometry and window are optional. A missing window means full history.
+        MATCH('(');
+        CHECK_PARSER_STATUS(ParseIdentifier(id));
+        dtype = PrimitiveTypeNameMap::Lookup(id);
+        if (dtype == 0) {
+          return ParseError("Expecting primitive payload type in KV-cache type.");
+        }
+        auto* cache_type = typeProto.mutable_kv_cache_type();
+        cache_type->set_elem_type(dtype);
+        MATCH(')');
+        if (Matches('[')) {
+          TensorShapeProto geometry;
+          if (!Matches(']')) {
+            PARSE(geometry);
+            MATCH(']');
+          }
+          if (geometry.dim_size() != 4) {
+            return ParseError("KV-cache geometry must have four dimensions.");
+          }
+          cache_type->mutable_batch_size()->CopyFrom(geometry.dim(0));
+          cache_type->mutable_num_kv_heads()->CopyFrom(geometry.dim(1));
+          cache_type->mutable_key_head_size()->CopyFrom(geometry.dim(2));
+          cache_type->mutable_value_head_size()->CopyFrom(geometry.dim(3));
+        }
+        if (Matches(';')) {
+          int64_t sliding_window = 0;
+          PARSE_TOKEN(sliding_window);
+          if (sliding_window < 0) {
+            return ParseError("KV-cache sliding_window must be nonnegative.");
+          }
+          cache_type->set_sliding_window(sliding_window);
+        }
+        break;
+      }
       default:
         return ParseError("Unexpected type.");
     }
@@ -726,6 +762,7 @@ bool OnnxParser::NextIsType() {
     case KeyWordMap::KeyWord::OPTIONAL_TYPE:
     case KeyWordMap::KeyWord::SPARSE_TENSOR_TYPE:
     case KeyWordMap::KeyWord::OPAQUE_TYPE:
+    case KeyWordMap::KeyWord::KV_CACHE_TYPE:
       return true;
     default:
       return false;

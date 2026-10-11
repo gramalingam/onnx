@@ -18,6 +18,7 @@ __all__ = [
     "IR_VERSION_2021_7_30",
     "IR_VERSION_2023_5_5",
     "IR_VERSION_2024_3_25",
+    "IR_VERSION_14",
     "EXPERIMENTAL",
     "STABLE",
     # Modules
@@ -103,6 +104,7 @@ from onnx.onnx_pb import (
     IR_VERSION_2021_7_30,
     IR_VERSION_2023_5_5,
     IR_VERSION_2024_3_25,
+    IR_VERSION_14,
     ModelProto,
     NodeDeviceConfigurationProto,
     NodeProto,

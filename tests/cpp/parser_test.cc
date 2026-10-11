@@ -156,6 +156,15 @@ TEST(ParserTest, TypeTest) {
   EXPECT_FALSE(type.opaque_type().has_domain());
   EXPECT_FALSE(type.opaque_type().has_name());
 
+  Parse(type, "kv_cache(float)[2, Hkv, 64, 80];128");
+  ASSERT_TRUE(type.has_kv_cache_type());
+  EXPECT_EQ(type.kv_cache_type().elem_type(), float_type);
+  EXPECT_EQ(type.kv_cache_type().batch_size().dim_value(), 2);
+  EXPECT_EQ(type.kv_cache_type().num_kv_heads().dim_param(), "Hkv");
+  EXPECT_EQ(type.kv_cache_type().key_head_size().dim_value(), 64);
+  EXPECT_EQ(type.kv_cache_type().value_head_size().dim_value(), 80);
+  EXPECT_EQ(type.kv_cache_type().sliding_window(), 128);
+
   // Quoted string as symbolic dimension (non-identifier dim_param):
   Parse(type, R"(float["M + N"])");
   EXPECT_TRUE(type.has_tensor_type());

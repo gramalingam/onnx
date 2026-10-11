@@ -128,7 +128,11 @@ enum Version {
 
   // IR VERSION 14 published on TBD
   // Added FLOAT6E2M3, FLOAT6E3M2 and made TypeProto.Opaque available in non-ONNX-ML builds.
-  IR_VERSION = 0x000000000000000E;
+  IR_VERSION_14 = 0x000000000000000E;
+
+  // IR VERSION 15 is experimental in this fork and is not an adopted ONNX release.
+  // Introduces the dedicated logical KV-cache type.
+  IR_VERSION = 0x000000000000000F;
 }
 
 // Attributes
@@ -907,6 +911,22 @@ message TypeProto {
     reserved "parameters";
   }
 
+  // A runtime-owned key/value attention cache. This describes only logical
+  // geometry and window semantics; it does not prescribe physical storage or
+  // serialize the runtime value.
+  message KVCache {
+    // K and V payload element type.
+    optional int32 elem_type = 1;
+    // Logical dimensions. Missing dimensions are unknown.
+    optional TensorShapeProto.Dimension batch_size = 2;
+    optional TensorShapeProto.Dimension num_kv_heads = 3;
+    optional TensorShapeProto.Dimension key_head_size = 4;
+    optional TensorShapeProto.Dimension value_head_size = 5;
+    // Zero or absent means full history; a positive value is the inclusive
+    // causal window size, including the current position.
+    optional int64 sliding_window = 6;
+  }
+
   oneof value {
     // The type of a tensor.
     Tensor tensor_type = 1;
@@ -931,6 +951,8 @@ message TypeProto {
 
     Opaque opaque_type = 7;
 
+    // The logical type of a runtime-owned KV cache.
+    KVCache kv_cache_type = 10;
   }
 
   // An optional denotation can be used to denote the whole

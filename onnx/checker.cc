@@ -138,6 +138,31 @@ static void check_type_ir_version(const TypeProto& type, const std::string& name
       check_data_type_ir_version(type.map_type().key_type(), name, ctx);
       check_type_ir_version(type.map_type().value_type(), name, ctx);
       break;
+    case TypeProto::kKvCacheType: {
+      if (ctx.get_ir_version() < 15) {
+        fail_check("KV-cache types require IR version >= 15 (value: ", name, ").");
+      }
+      const auto& cache_type = type.kv_cache_type();
+      enforce_has_field(cache_type, elem_type);
+      check_data_type_ir_version(cache_type.elem_type(), name, ctx);
+      if (cache_type.elem_type() != TensorProto::FLOAT && cache_type.elem_type() != TensorProto::FLOAT16 &&
+          cache_type.elem_type() != TensorProto::BFLOAT16) {
+        fail_check("KV-cache payload element type must be FLOAT, FLOAT16, or BFLOAT16 (value: ", name, ").");
+      }
+      if (cache_type.has_sliding_window() && cache_type.sliding_window() < 0) {
+        fail_check("KV-cache sliding_window must be nonnegative (value: ", name, ").");
+      }
+      if (cache_type.has_batch_size() && cache_type.batch_size().has_dim_value() &&
+          cache_type.batch_size().dim_value() < 0) {
+        fail_check("KV-cache batch_size must be nonnegative (value: ", name, ").");
+      }
+      for (const auto* dim : {&cache_type.num_kv_heads(), &cache_type.key_head_size(), &cache_type.value_head_size()}) {
+        if (dim->has_dim_value() && dim->dim_value() <= 0) {
+          fail_check("KV-cache head counts and widths must be positive (value: ", name, ").");
+        }
+      }
+      break;
+    }
     default:
       break;
   }
@@ -194,6 +219,8 @@ void check_value_info(const ValueInfoProto& value_info, const CheckerContext& ct
       enforce_has_field(type, elem_type);
       enforce_has_field(type, shape);
     } break;
+    case TypeProto::kKvCacheType:
+      break;
 
     default:
       fail_check("Unrecognized type value case (value_info name: ", value_info.name(), "): ", value_case);

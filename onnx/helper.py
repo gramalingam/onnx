@@ -856,6 +856,65 @@ def make_tensor_value_info(
     return value_info_proto
 
 
+def make_kv_cache_type_proto(
+    elem_type: int,
+    batch_size: int | str | None = None,
+    num_kv_heads: int | str | None = None,
+    key_head_size: int | str | None = None,
+    value_head_size: int | str | None = None,
+    sliding_window: int = 0,
+) -> TypeProto:
+    """Makes a logical KV-cache TypeProto; no physical storage is described."""
+    if sliding_window < 0:
+        raise ValueError("sliding_window must be nonnegative.")
+
+    type_proto = TypeProto()
+    cache_type = type_proto.kv_cache_type
+    cache_type.elem_type = elem_type
+    cache_type.sliding_window = sliding_window
+    for field, value, strictly_positive in (
+        ("batch_size", batch_size, False),
+        ("num_kv_heads", num_kv_heads, True),
+        ("key_head_size", key_head_size, True),
+        ("value_head_size", value_head_size, True),
+    ):
+        if value is None:
+            continue
+        if isinstance(value, int) and not isinstance(value, bool):
+            invalid = value <= 0 if strictly_positive else value < 0
+            if invalid:
+                bound = "positive" if strictly_positive else "nonnegative"
+                raise ValueError(f"{field} must be {bound}.")
+            getattr(cache_type, field).dim_value = value
+        elif isinstance(value, str) and value:
+            getattr(cache_type, field).dim_param = value
+        else:
+            raise ValueError(f"Invalid {field}: {value!r}. Needs a nonnegative int or nonempty string.")
+    return type_proto
+
+
+def make_kv_cache_type(
+    name: str,
+    elem_type: int,
+    batch_size: int | str | None = None,
+    num_kv_heads: int | str | None = None,
+    key_head_size: int | str | None = None,
+    value_head_size: int | str | None = None,
+    sliding_window: int = 0,
+    doc_string: str = "",
+) -> ValueInfoProto:
+    """Makes a ValueInfoProto for a logical KV-cache graph value."""
+    type_proto = make_kv_cache_type_proto(
+        elem_type,
+        batch_size,
+        num_kv_heads,
+        key_head_size,
+        value_head_size,
+        sliding_window,
+    )
+    return make_value_info(name, type_proto, doc_string)
+
+
 def make_sparse_tensor_type_proto(
     elem_type: int,
     shape: Sequence[str | int | None] | None,
