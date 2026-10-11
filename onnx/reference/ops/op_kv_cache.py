@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from dataclasses import dataclass
+from typing import TypedDict, TypeGuard
 
 import numpy as np
 
@@ -12,13 +12,23 @@ from onnx.reference.op_run import OpRun
 from onnx.reference.ops.op_attention import _compute_attention
 
 
-@dataclass(frozen=True)
-class _KVCacheValue:
+class _KVCacheValue(TypedDict):
     keys: np.ndarray
     values: np.ndarray
     elem_type: int
     sliding_window: int
     end_position: int
+
+
+def _is_cache_value(value: object) -> TypeGuard[_KVCacheValue]:
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("keys"), np.ndarray)
+        and isinstance(value.get("values"), np.ndarray)
+        and isinstance(value.get("elem_type"), int)
+        and isinstance(value.get("sliding_window"), int)
+        and isinstance(value.get("end_position"), int)
+    )
 
 
 class KVCacheCreate(OpRun):
@@ -42,13 +52,13 @@ class KVCacheCreate(OpRun):
         keys = np.empty((batch_size, num_kv_heads, 0, key_head_size), dtype=dtype)
         values = np.empty((batch_size, num_kv_heads, 0, value_head_size), dtype=dtype)
         return (
-            _KVCacheValue(
-                keys=keys,
-                values=values,
-                elem_type=elem_type,
-                sliding_window=sliding_window,
-                end_position=0,
-            ),
+            {
+                "keys": keys,
+                "values": values,
+                "elem_type": elem_type,
+                "sliding_window": sliding_window,
+                "end_position": 0,
+            },
         )
 
 
@@ -69,9 +79,9 @@ class AttentionWithCache(OpRun):
         softcap=0.0,
         sliding_window=0,
     ):
-        if not isinstance(cache, _KVCacheValue):
+        if not _is_cache_value(cache):
             raise TypeError("AttentionWithCache expects a reference KV-cache value.")
-        if sliding_window != cache.sliding_window:
+        if sliding_window != cache["sliding_window"]:
             raise ValueError("AttentionWithCache sliding_window must match the cache type.")
         if sliding_window > 0 and is_causal != 1:
             raise ValueError("A sliding-window cache requires is_causal=1.")
@@ -85,19 +95,19 @@ class AttentionWithCache(OpRun):
             raise ValueError("AttentionWithCache K_new and V_new sequence lengths must match.")
         if Q.shape[3] != K_new.shape[3]:
             raise ValueError("AttentionWithCache query and key widths must match.")
-        if K_new.shape[1] != V_new.shape[1] or K_new.shape[1] != cache.keys.shape[1]:
+        if K_new.shape[1] != V_new.shape[1] or K_new.shape[1] != cache["keys"].shape[1]:
             raise ValueError("AttentionWithCache KV head counts must match.")
-        if Q.shape[0] != cache.keys.shape[0] or K_new.shape[3] != cache.keys.shape[3]:
+        if Q.shape[0] != cache["keys"].shape[0] or K_new.shape[3] != cache["keys"].shape[3]:
             raise ValueError("AttentionWithCache inputs do not match cache geometry.")
-        if V_new.shape[3] != cache.values.shape[3]:
+        if V_new.shape[3] != cache["values"].shape[3]:
             raise ValueError("AttentionWithCache value width does not match cache geometry.")
-        if Q.dtype != cache.keys.dtype or K_new.dtype != cache.keys.dtype or V_new.dtype != cache.values.dtype:
+        if Q.dtype != cache["keys"].dtype or K_new.dtype != cache["keys"].dtype or V_new.dtype != cache["values"].dtype:
             raise ValueError("AttentionWithCache tensor types must match the cache payload type.")
         if Q.shape[1] % K_new.shape[1] != 0:
             raise ValueError("Query head count must be divisible by KV head count.")
 
         expected_positions = np.arange(
-            cache.end_position, cache.end_position + K_new.shape[2], dtype=np.int64
+            cache["end_position"], cache["end_position"] + K_new.shape[2], dtype=np.int64
         )
         if positions is not None:
             positions = np.asarray(positions)
@@ -106,15 +116,15 @@ class AttentionWithCache(OpRun):
             if not np.all(positions == expected_positions):
                 raise ValueError("positions must be contiguous and start at the cache end position.")
 
-        all_keys = np.concatenate((cache.keys, K_new), axis=2)
-        all_values = np.concatenate((cache.values, V_new), axis=2)
+        all_keys = np.concatenate((cache["keys"], K_new), axis=2)
+        all_values = np.concatenate((cache["values"], V_new), axis=2)
         output, _, _, _ = _compute_attention(
             Q,
             K_new,
             V_new,
             attn_mask=attn_mask,
-            past_key=cache.keys,
-            past_value=cache.values,
+            past_key=cache["keys"],
+            past_value=cache["values"],
             scale=scale,
             is_causal=is_causal,
             q_num_heads=q_num_heads,
@@ -123,38 +133,38 @@ class AttentionWithCache(OpRun):
             softcap=softcap,
             left_window_size=sliding_window - 1 if sliding_window > 0 else -1,
         )
-        end_position = cache.end_position + K_new.shape[2]
+        end_position = cache["end_position"] + K_new.shape[2]
         if sliding_window > 0:
             all_keys = all_keys[:, :, -sliding_window:, :]
             all_values = all_values[:, :, -sliding_window:, :]
-        next_cache = _KVCacheValue(
-            keys=all_keys,
-            values=all_values,
-            elem_type=cache.elem_type,
-            sliding_window=cache.sliding_window,
-            end_position=end_position,
-        )
+        next_cache = {
+            "keys": all_keys,
+            "values": all_values,
+            "elem_type": cache["elem_type"],
+            "sliding_window": cache["sliding_window"],
+            "end_position": end_position,
+        }
         return output, next_cache
 
 
 class KVCacheExport(OpRun):
     def _run(self, cache):
-        if not isinstance(cache, _KVCacheValue):
+        if not _is_cache_value(cache):
             raise TypeError("KVCacheExport expects a reference KV-cache value.")
-        start_position = cache.end_position - cache.keys.shape[2]
-        positions = np.arange(start_position, cache.end_position, dtype=np.int64)
-        positions = np.broadcast_to(positions, (cache.keys.shape[0], positions.size)).copy()
-        return cache.keys, cache.values, positions
+        start_position = cache["end_position"] - cache["keys"].shape[2]
+        positions = np.arange(start_position, cache["end_position"], dtype=np.int64)
+        positions = np.broadcast_to(positions, (cache["keys"].shape[0], positions.size)).copy()
+        return cache["keys"], cache["values"], positions
 
 
 class KVCacheDescribe(OpRun):
     def _run(self, cache):
-        if not isinstance(cache, _KVCacheValue):
+        if not _is_cache_value(cache):
             raise TypeError("KVCacheDescribe expects a reference KV-cache value.")
-        lengths = np.full((cache.keys.shape[0],), cache.end_position, dtype=np.int64)
-        start_position = cache.end_position - cache.keys.shape[2]
+        lengths = np.full((cache["keys"].shape[0],), cache["end_position"], dtype=np.int64)
+        start_position = cache["end_position"] - cache["keys"].shape[2]
         retained_range = np.tile(
-            np.array([start_position, cache.end_position], dtype=np.int64),
-            (cache.keys.shape[0], 1),
+            np.array([start_position, cache["end_position"]], dtype=np.int64),
+            (cache["keys"].shape[0], 1),
         )
         return lengths, retained_range

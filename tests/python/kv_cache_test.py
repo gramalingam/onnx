@@ -136,7 +136,7 @@ def test_attention_with_cache_rejects_window_mismatch() -> None:
         ],
     )
     with pytest.raises(onnx.shape_inference.InferenceError, match="must match the cache type"):
-        shape_inference.infer_shapes(_model(graph))
+        shape_inference.infer_shapes(_model(graph), strict_mode=True)
 
 
 def test_reference_sliding_cache_is_functional_and_chunk_aware() -> None:
